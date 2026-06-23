@@ -1,182 +1,257 @@
-import os
-import re
-import json
-import time
 import asyncio
+import json
+import os
+import time
 from pathlib import Path
 
-from PIL import Image, ImageDraw
-from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, ContextTypes, filters
-
-TOKEN = os.getenv("BOT_TOKEN")
-DATA_FILE = Path("data.json")
-STATUS_COUNT = 40
-
-EXTRA = """BEBRA RENT
-Крутой аккаунт
-Есть машинка
-1337"""
+from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ContentType
+from aiogram.types import Message, InputMediaPhoto
+from aiogram.filters import Command
 
 
-def load():
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = int(os.getenv("CHAT_ID", "0"))
+
+STATUSES_COUNT = 40
+DATA_FILE = Path("statuses.json")
+
+DEFAULT_PHOTO_URL = os.getenv(
+    "DEFAULT_PHOTO_URL",
+    "https://picsum.photos/900/600"
+)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+
+def load_data():
     if DATA_FILE.exists():
-        return json.loads(DATA_FILE.read_text())
-    return {"chat_id": None, "statuses": {}, "timers": {}}
+        return json.loads(DATA_FILE.read_text(encoding="utf-8"))
 
-
-def save(data):
-    DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-
-
-def caption(num, busy=False, left="00:00:00"):
-    if busy:
-        first = f"Статус {num}: 🔴 Занят {left}"
-    else:
-        first = f"Статус {num}: 🟢 Свободно"
-    return first + "\n\n" + EXTRA
-
-
-def make_img(num):
-    path = f"status_{num}.png"
-    img = Image.new("RGB", (1200, 800), (15, 15, 18))
-    d = ImageDraw.Draw(img)
-    d.text((330, 300), "BEBRA RENT", fill=(255, 255, 255))
-    d.text((470, 410), f"STATUS {num}", fill=(255, 255, 255))
-    img.save(path)
-    return path
-
-
-async def create40(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = {"chat_id": update.effective_chat.id, "statuses": {}, "timers": {}}
-
-    for num in range(1, STATUS_COUNT + 1):
-        img = make_img(num)
-        with open(img, "rb") as p:
-            msg = await context.bot.send_photo(
-                chat_id=update.effective_chat.id,
-                photo=p,
-                caption=caption(num)
-            )
-
-        data["statuses"][str(msg.message_id)] = {
-            "num": num,
-            "message_id": msg.message_id
-        }
-
-        await asyncio.sleep(0.3)
-
-    save(data)
-    await update.message.reply_text("Готово: 40 статусов созданы.")
-
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-
-    if not msg or not msg.text:
-        return
-
-    if not msg.reply_to_message:
-        return
-
-    text = msg.text.strip().lower()
-
-    if not re.fullmatch(r"\d+|0|free|stop|стоп|свободно", text):
-        return
-
-    data = load()
-
-    replied_id = str(msg.reply_to_message.message_id)
-
-    if replied_id not in data["statuses"]:
-        return
-
-    status = data["statuses"][replied_id]
-    num = status["num"]
-    status_message_id = status["message_id"]
-    chat_id = data["chat_id"]
-
-    if text in ["0", "free", "stop", "стоп", "свободно"]:
-        data["timers"].pop(replied_id, None)
-        save(data)
-
-        await context.bot.edit_message_caption(
-            chat_id=chat_id,
-            message_id=status_message_id,
-            caption=caption(num)
-        )
-        return
-
-    hours = int(text)
-
-    if hours <= 0:
-        return
-
-    finish = int(time.time() + hours * 3600)
-
-    data["timers"][replied_id] = {
-        "finish": finish,
-        "num": num,
-        "message_id": status_message_id
+    data = {
+        "statuses": {}
     }
+    save_data(data)
+    return data
 
-    save(data)
 
-    await context.bot.edit_message_caption(
-        chat_id=chat_id,
-        message_id=status_message_id,
-        caption=caption(num, True, f"{hours:02d}:00:00")
+def save_data(data):
+    DATA_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8"
     )
 
 
-async def loop(app):
+data = load_data()
+
+
+def format_left(seconds: int) -> str:
+    if seconds < 0:
+        seconds = 0
+
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+
+    return f"{hours}ч {minutes:02d}м"
+
+
+def make_caption(status_id: str) -> str:
+    status = data["statuses"][status_id]
+
+    text = status.get("text", "")
+    busy_until = status.get("busy_until")
+
+    lines = [f"Статус {status_id}", ""]
+
+    if busy_until and busy_until > int(time.time()):
+        left = busy_until - int(time.time())
+        lines.append("🔴 Занят")
+        lines.append(f"Осталось: {format_left(left)}")
+    else:
+        lines.append("🟢 Свободен")
+
+    if text:
+        lines.append(text)
+
+    return "\n".join(lines)
+
+
+async def edit_status(status_id: str):
+    status = data["statuses"][status_id]
+
+    try:
+        await bot.edit_message_caption(
+            chat_id=CHAT_ID,
+            message_id=status["message_id"],
+            caption=make_caption(status_id)
+        )
+    except Exception as e:
+        print(f"Не смог обновить статус {status_id}: {e}")
+
+
+def find_status_by_message_id(message_id: int):
+    for status_id, status in data["statuses"].items():
+        if status.get("message_id") == message_id:
+            return status_id
+    return None
+
+
+@dp.message(Command("setup"))
+async def setup(message: Message):
+    if message.chat.id != CHAT_ID:
+        await message.answer("Эту команду нужно писать в нужной группе.")
+        return
+
+    if data["statuses"]:
+        await message.answer("Статусы уже созданы. Если нужно заново — напиши /reset.")
+        return
+
+    for i in range(1, STATUSES_COUNT + 1):
+        status_id = str(i)
+
+        sent = await bot.send_photo(
+            chat_id=CHAT_ID,
+            photo=DEFAULT_PHOTO_URL,
+            caption=f"Статус {status_id}\n\n🟢 Свободен"
+        )
+
+        data["statuses"][status_id] = {
+            "message_id": sent.message_id,
+            "photo": DEFAULT_PHOTO_URL,
+            "text": "",
+            "busy_until": None
+        }
+
+        save_data(data)
+        await asyncio.sleep(0.3)
+
+    await message.answer("Готово. Создал 40 статусов.")
+
+
+@dp.message(Command("reset"))
+async def reset(message: Message):
+    if message.chat.id != CHAT_ID:
+        return
+
+    data["statuses"] = {}
+    save_data(data)
+
+    await message.answer("Список статусов очищен. Теперь напиши /setup.")
+
+
+@dp.message(F.reply_to_message)
+async def handle_reply(message: Message):
+    if message.chat.id != CHAT_ID:
+        return
+
+    replied_id = message.reply_to_message.message_id
+    status_id = find_status_by_message_id(replied_id)
+
+    if not status_id:
+        return
+
+    status = data["statuses"][status_id]
+
+    # 1. Если ответили фотографией — меняем картинку статуса
+    if message.content_type == ContentType.PHOTO:
+        file_id = message.photo[-1].file_id
+        status["photo"] = file_id
+        save_data(data)
+
+        try:
+            await bot.edit_message_media(
+                chat_id=CHAT_ID,
+                message_id=status["message_id"],
+                media=InputMediaPhoto(
+                    media=file_id,
+                    caption=make_caption(status_id)
+                )
+            )
+            await message.delete()
+        except Exception as e:
+            await message.answer(f"Не смог заменить фото: {e}")
+
+        return
+
+    # 2. Если ответили текстом
+    if message.content_type != ContentType.TEXT:
+        return
+
+    text = message.text.strip()
+
+    # Число = таймер в часах
+    if text.isdigit():
+        hours = int(text)
+
+        if hours <= 0:
+            await message.answer("Напиши число больше 0.")
+            return
+
+        status["busy_until"] = int(time.time()) + hours * 3600
+        save_data(data)
+
+        await edit_status(status_id)
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        return
+
+    # + текст = нижний текст статуса
+    if text.startswith("+"):
+        new_text = text[1:].strip()
+
+        status["text"] = new_text
+        save_data(data)
+
+        await edit_status(status_id)
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        return
+
+    await message.answer(
+        "Ответь на статус:\n"
+        "6 — таймер на 6 часов\n"
+        "+ текст — изменить нижний текст\n"
+        "фото — изменить картинку"
+    )
+
+
+async def timer_loop():
     while True:
-        data = load()
         now = int(time.time())
 
-        for replied_id, timer in list(data["timers"].items()):
-            left = timer["finish"] - now
-            num = timer["num"]
-            msg_id = timer["message_id"]
-            chat_id = data["chat_id"]
+        for status_id, status in data["statuses"].items():
+            busy_until = status.get("busy_until")
 
-            try:
-                if left <= 0:
-                    await app.bot.edit_message_caption(
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        caption=caption(num)
-                    )
-                    del data["timers"][replied_id]
-                    save(data)
+            if busy_until:
+                if busy_until <= now:
+                    status["busy_until"] = None
+                    save_data(data)
+                    await edit_status(status_id)
                 else:
-                    h = left // 3600
-                    m = (left % 3600) // 60
-                    s = left % 60
-
-                    await app.bot.edit_message_caption(
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        caption=caption(num, True, f"{h:02d}:{m:02d}:{s:02d}")
-                    )
-            except Exception as e:
-                print("TIMER ERROR:", e)
+                    await edit_status(status_id)
 
         await asyncio.sleep(60)
 
 
-async def post_init(app):
-    asyncio.create_task(loop(app))
+async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Нет BOT_TOKEN")
 
+    if CHAT_ID == 0:
+        raise RuntimeError("Нет CHAT_ID")
 
-def main():
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
-
-    app.add_handler(CommandHandler("create40", create40))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-
-    app.run_polling()
+    asyncio.create_task(timer_loop())
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
