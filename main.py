@@ -5,14 +5,21 @@ import time
 import asyncio
 from pathlib import Path
 
+from PIL import Image, ImageDraw
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, ContextTypes, filters
 
 TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
-DATA_FILE = Path("data.json")
 STATUS_COUNT = 40
+DATA_FILE = Path("data.json")
+
+
+DEFAULT_EXTRA = """BEBRA RENT
+Крутой аккаунт
+Есть машинка
+1337"""
 
 
 def load_data():
@@ -25,55 +32,63 @@ def save_data(data):
     DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
 
-def make_text(num, busy=False, left_text=None, extra=None):
-    if extra is None:
-        extra = "BEBRA RENT\nКрутой аккаунт\nЕсть машинка\n1337"
-
+def status_text(num, busy=False, left="00:00:00", extra=DEFAULT_EXTRA):
     if busy:
-        first = f"Статус {num}: 🔴 Занят {left_text}"
+        first = f"Статус {num}: 🔴 Занят {left}"
     else:
         first = f"Статус {num}: 🟢 Свободно"
 
     return first + "\n\n" + extra
 
 
-def get_extra(text):
-    if not text:
-        return "BEBRA RENT\nКрутой аккаунт\nЕсть машинка\n1337"
-    parts = text.split("\n\n", 1)
-    if len(parts) == 2:
-        return parts[1]
-    return "BEBRA RENT\nКрутой аккаунт\nЕсть машинка\n1337"
+def make_image(num):
+    path = f"status_{num}.png"
+
+    img = Image.new("RGB", (1200, 800), (18, 18, 22))
+    draw = ImageDraw.Draw(img)
+
+    draw.rectangle((60, 60, 1140, 740), outline=(255, 255, 255), width=6)
+    draw.text((310, 270), "BEBRA RENT", fill=(255, 255, 255))
+    draw.text((460, 390), f"STATUS {num}", fill=(255, 255, 255))
+
+    img.save(path)
+    return path
 
 
 async def create40(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
+    data = {"statuses": {}, "timers": {}}
 
-    for i in range(1, STATUS_COUNT + 1):
-        msg = await context.bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=make_text(i)
-        )
+    for num in range(1, STATUS_COUNT + 1):
+        img_path = make_image(num)
 
-        data["statuses"][str(i)] = {
+        with open(img_path, "rb") as photo:
+            msg = await context.bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=photo,
+                caption=status_text(num)
+            )
+
+        data["statuses"][str(num)] = {
             "message_id": msg.message_id,
-            "extra": "BEBRA RENT\nКрутой аккаунт\nЕсть машинка\n1337"
+            "extra": DEFAULT_EXTRA
         }
 
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.4)
 
     save_data(data)
-    await update.effective_message.reply_text("40 статусов созданы.")
+
+    if update.effective_message:
+        await update.effective_message.reply_text("Готово. Создано 40 статусов.")
 
 
-async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or not msg.text:
         return
 
     text = msg.text.strip().lower()
 
-    match = re.fullmatch(r"(\d{1,2})\s+(\d+|free|стоп|stop|свободно)", text)
+    match = re.fullmatch(r"(\d{1,2})\s+(\d+|0|free|stop|стоп|свободно)", text)
     if not match:
         return
 
@@ -90,17 +105,21 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status = data["statuses"][str(num)]
     message_id = status["message_id"]
-    extra = status.get("extra", "BEBRA RENT\nКрутой аккаунт\nЕсть машинка\n1337")
+    extra = status.get("extra", DEFAULT_EXTRA)
 
-    if value in ["free", "стоп", "stop", "свободно"] or value == "0":
+    if value in ["0", "free", "stop", "стоп", "свободно"]:
         data["timers"].pop(str(num), None)
         save_data(data)
 
-        await context.bot.edit_message_text(
-            chat_id=CHANNEL_ID,
-            message_id=message_id,
-            text=make_text(num, busy=False, extra=extra)
-        )
+        try:
+            await context.bot.edit_message_caption(
+                chat_id=CHANNEL_ID,
+                message_id=message_id,
+                caption=status_text(num, busy=False, extra=extra)
+            )
+        except Exception as e:
+            print("FREE ERROR:", e)
+
         return
 
     hours = int(value)
@@ -112,6 +131,17 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     save_data(data)
 
+    left = f"{hours:02d}:00:00"
+
+    try:
+        await context.bot.edit_message_caption(
+            chat_id=CHANNEL_ID,
+            message_id=message_id,
+            caption=status_text(num, busy=True, left=left, extra=extra)
+        )
+    except Exception as e:
+        print("START ERROR:", e)
+
 
 async def timer_loop(app):
     while True:
@@ -120,39 +150,39 @@ async def timer_loop(app):
         changed = False
 
         for num_str, timer in list(data["timers"].items()):
-            num = int(num_str)
             status = data["statuses"].get(num_str)
-
             if not status:
                 continue
 
+            num = int(num_str)
             message_id = status["message_id"]
-            extra = status.get("extra", "BEBRA RENT\nКрутой аккаунт\nЕсть машинка\n1337")
-            left = timer["finish"] - now
+            extra = status.get("extra", DEFAULT_EXTRA)
+
+            left_seconds = int(timer["finish"] - now)
 
             try:
-                if left <= 0:
-                    await app.bot.edit_message_text(
+                if left_seconds <= 0:
+                    await app.bot.edit_message_caption(
                         chat_id=CHANNEL_ID,
                         message_id=message_id,
-                        text=make_text(num, busy=False, extra=extra)
+                        caption=status_text(num, busy=False, extra=extra)
                     )
                     del data["timers"][num_str]
                     changed = True
                 else:
-                    h = left // 3600
-                    m = (left % 3600) // 60
-                    s = left % 60
-                    left_text = f"{h:02d}:{m:02d}:{s:02d}"
+                    h = left_seconds // 3600
+                    m = (left_seconds % 3600) // 60
+                    s = left_seconds % 60
+                    left = f"{h:02d}:{m:02d}:{s:02d}"
 
-                    await app.bot.edit_message_text(
+                    await app.bot.edit_message_caption(
                         chat_id=CHANNEL_ID,
                         message_id=message_id,
-                        text=make_text(num, busy=True, left_text=left_text, extra=extra)
+                        caption=status_text(num, busy=True, left=left, extra=extra)
                     )
 
             except Exception as e:
-                print("EDIT ERROR:", e)
+                print("TIMER ERROR:", e)
 
         if changed:
             save_data(data)
@@ -165,10 +195,15 @@ async def post_init(app):
 
 
 def main():
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN не найден")
+    if not CHANNEL_ID:
+        raise RuntimeError("CHANNEL_ID не найден")
+
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("create40", create40))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.run_polling()
 
