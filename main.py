@@ -5,7 +5,6 @@ import time
 import asyncio
 from pathlib import Path
 
-from PIL import Image, ImageDraw
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, ContextTypes, filters
 
@@ -26,7 +25,7 @@ def save_data(data):
     DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
 
-def make_caption(num, busy=False, left_text=None, extra=None):
+def make_text(num, busy=False, left_text=None, extra=None):
     if extra is None:
         extra = "BEBRA RENT\nКрутой аккаунт\nЕсть машинка\n1337"
 
@@ -38,91 +37,77 @@ def make_caption(num, busy=False, left_text=None, extra=None):
     return first + "\n\n" + extra
 
 
-def get_extra_text(caption):
-    parts = caption.split("\n\n", 1)
+def get_extra(text):
+    if not text:
+        return "BEBRA RENT\nКрутой аккаунт\nЕсть машинка\n1337"
+    parts = text.split("\n\n", 1)
     if len(parts) == 2:
         return parts[1]
     return "BEBRA RENT\nКрутой аккаунт\nЕсть машинка\n1337"
-
-
-def make_image(num):
-    path = f"status_{num}.png"
-    img = Image.new("RGB", (1200, 800), (20, 20, 20))
-    draw = ImageDraw.Draw(img)
-    draw.text((300, 280), "BEBRA RENT", fill=(255, 255, 255))
-    draw.text((470, 390), f"STATUS {num}", fill=(255, 255, 255))
-    img.save(path)
-    return path
 
 
 async def create40(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
 
     for i in range(1, STATUS_COUNT + 1):
-        img_path = make_image(i)
-        msg = await context.bot.send_photo(
+        msg = await context.bot.send_message(
             chat_id=CHANNEL_ID,
-            photo=open(img_path, "rb"),
-            caption=make_caption(i)
+            text=make_text(i)
         )
 
-        data["statuses"][str(msg.message_id)] = {
-            "num": i,
-            "chat_id": CHANNEL_ID
+        data["statuses"][str(i)] = {
+            "message_id": msg.message_id,
+            "extra": "BEBRA RENT\nКрутой аккаунт\nЕсть машинка\n1337"
         }
 
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.3)
 
     save_data(data)
-    await update.effective_message.reply_text("Готово: 40 статусов созданы.")
+    await update.effective_message.reply_text("40 статусов созданы.")
 
 
 async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    if not msg or not msg.reply_to_message:
+    if not msg or not msg.text:
         return
 
-    text = (msg.text or "").strip().lower()
-    replied = msg.reply_to_message
-    replied_id = str(replied.message_id)
+    text = msg.text.strip().lower()
+
+    match = re.fullmatch(r"(\d{1,2})\s+(\d+|free|стоп|stop|свободно)", text)
+    if not match:
+        return
+
+    num = int(match.group(1))
+    value = match.group(2)
+
+    if num < 1 or num > STATUS_COUNT:
+        return
 
     data = load_data()
 
-    if replied_id not in data["statuses"]:
+    if str(num) not in data["statuses"]:
         return
 
-    status = data["statuses"][replied_id]
-    num = status["num"]
+    status = data["statuses"][str(num)]
+    message_id = status["message_id"]
+    extra = status.get("extra", "BEBRA RENT\nКрутой аккаунт\nЕсть машинка\n1337")
 
-    old_caption = replied.caption or replied.text or ""
-    extra = get_extra_text(old_caption)
-
-    if text in ["0", "free", "свободно", "стоп", "stop"]:
-        data["timers"].pop(replied_id, None)
+    if value in ["free", "стоп", "stop", "свободно"] or value == "0":
+        data["timers"].pop(str(num), None)
         save_data(data)
 
-        await context.bot.edit_message_caption(
+        await context.bot.edit_message_text(
             chat_id=CHANNEL_ID,
-            message_id=int(replied_id),
-            caption=make_caption(num, busy=False, extra=extra)
+            message_id=message_id,
+            text=make_text(num, busy=False, extra=extra)
         )
         return
 
-    if not re.fullmatch(r"\d+", text):
-        return
-
-    hours = int(text)
-    if hours <= 0:
-        return
-
+    hours = int(value)
     finish = int(time.time() + hours * 3600)
 
-    data["timers"][replied_id] = {
-        "num": num,
-        "chat_id": CHANNEL_ID,
-        "message_id": int(replied_id),
-        "finish": finish,
-        "extra": extra
+    data["timers"][str(num)] = {
+        "finish": finish
     }
 
     save_data(data)
@@ -134,19 +119,25 @@ async def timer_loop(app):
         now = int(time.time())
         changed = False
 
-        for msg_id, timer in list(data["timers"].items()):
+        for num_str, timer in list(data["timers"].items()):
+            num = int(num_str)
+            status = data["statuses"].get(num_str)
+
+            if not status:
+                continue
+
+            message_id = status["message_id"]
+            extra = status.get("extra", "BEBRA RENT\nКрутой аккаунт\nЕсть машинка\n1337")
             left = timer["finish"] - now
-            num = timer["num"]
-            extra = timer.get("extra")
 
             try:
                 if left <= 0:
-                    await app.bot.edit_message_caption(
+                    await app.bot.edit_message_text(
                         chat_id=CHANNEL_ID,
-                        message_id=int(msg_id),
-                        caption=make_caption(num, busy=False, extra=extra)
+                        message_id=message_id,
+                        text=make_text(num, busy=False, extra=extra)
                     )
-                    del data["timers"][msg_id]
+                    del data["timers"][num_str]
                     changed = True
                 else:
                     h = left // 3600
@@ -154,10 +145,10 @@ async def timer_loop(app):
                     s = left % 60
                     left_text = f"{h:02d}:{m:02d}:{s:02d}"
 
-                    await app.bot.edit_message_caption(
+                    await app.bot.edit_message_text(
                         chat_id=CHANNEL_ID,
-                        message_id=int(msg_id),
-                        caption=make_caption(num, busy=True, left_text=left_text, extra=extra)
+                        message_id=message_id,
+                        text=make_text(num, busy=True, left_text=left_text, extra=extra)
                     )
 
             except Exception as e:
