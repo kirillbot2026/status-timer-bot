@@ -1,14 +1,14 @@
 import asyncio
 import json
 import os
+import re
 import time
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ContentType
-from aiogram.types import Message, InputMediaPhoto
 from aiogram.filters import Command
-
+from aiogram.types import Message, InputMediaPhoto
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
@@ -16,10 +16,7 @@ CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 STATUSES_COUNT = 55
 DATA_FILE = Path("statuses.json")
 
-DEFAULT_PHOTO_URL = os.getenv(
-    "DEFAULT_PHOTO_URL",
-    "https://picsum.photos/900/600"
-)
+DEFAULT_PHOTO_URL = "https://picsum.photos/900/600"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -27,8 +24,21 @@ dp = Dispatcher()
 
 def load_data():
     if DATA_FILE.exists():
-        return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        try:
+            return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
     data = {"statuses": {}}
+
+    for i in range(1, STATUSES_COUNT + 1):
+        data["statuses"][str(i)] = {
+            "message_id": None,
+            "photo": DEFAULT_PHOTO_URL,
+            "text": "",
+            "busy_until": None,
+        }
+
     save_data(data)
     return data
 
@@ -36,144 +46,92 @@ def load_data():
 def save_data(data):
     DATA_FILE.write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8"
+        encoding="utf-8",
     )
 
 
 data = load_data()
 
 
-def format_left(seconds: int) -> str:
-    if seconds < 0:
-        seconds = 0
+def format_time_left(seconds):
     hours = seconds // 3600
     minutes = (seconds % 3600) // 60
-    return f"{hours} {minutes:02d}"
+    return f"{hours}ч {minutes}м"
 
 
-def make_caption(status_id: str) -> str:
+def make_caption(status_id):
     status = data["statuses"][status_id]
-    text = status.get("text", "")
-    busy_until = status.get("busy_until")
 
-    lines = [f" {status_id}", ""]
+    lines = [f"Статус {status_id}", ""]
+
+    busy_until = status.get("busy_until")
 
     if busy_until and busy_until > int(time.time()):
         left = busy_until - int(time.time())
-        lines.append(" ")
-        lines.append(f": {format_left(left)}")
-    else:
-        lines.append(" ")
 
-    if text:
-        lines.append(text)
+        lines.append("🔴 Занят")
+        lines.append(f"⏳ Осталось: {format_time_left(left)}")
+    else:
+        lines.append("🟢 Свободен")
+
+    if status.get("text"):
+        lines.append("")
+        lines.append(status["text"])
 
     return "\n".join(lines)
 
 
-async def edit_status(status_id: str):
+async def update_status_message(status_id):
     status = data["statuses"][status_id]
+
+    if not status.get("message_id"):
+        return
 
     try:
         await bot.edit_message_caption(
             chat_id=CHAT_ID,
             message_id=status["message_id"],
-            caption=make_caption(status_id)
+            caption=make_caption(status_id),
         )
-    except Exception as e:
-        print(f"   {status_id}: {e}")
+    except Exception:
+        pass
 
 
-def find_status_by_message_id(message_id: int):
+def find_status_by_message(message_id):
     for status_id, status in data["statuses"].items():
         if status.get("message_id") == message_id:
             return status_id
+
     return None
-
-
-@dp.message(Command("setup"))
-async def setup(message: Message):
+    @dp.message(Command("setup"))
+async def setup_command(message: Message):
     if message.chat.id != CHAT_ID:
-        await message.answer("      .")
-        return
-
-    if data["statuses"]:
-        await message.answer("  .      /continue.")
         return
 
     for i in range(1, STATUSES_COUNT + 1):
         status_id = str(i)
+        status = data["statuses"][status_id]
+
+        if status.get("message_id"):
+            continue
 
         sent = await bot.send_photo(
             chat_id=CHAT_ID,
-            photo=DEFAULT_PHOTO_URL,
-            caption=f" {status_id}\n\n "
+            photo=status["photo"],
+            caption=make_caption(status_id),
         )
 
-        data["statuses"][status_id] = {
-            "message_id": sent.message_id,
-            "photo": DEFAULT_PHOTO_URL,
-            "text": "",
-            "busy_until": None
-        }
-
+        status["message_id"] = sent.message_id
         save_data(data)
-        await asyncio.sleep(0.5)
 
-    await message.answer(".  40 .")
-
-
-@dp.message(Command("continue"))
-async def continue_setup(message: Message):
-    if message.chat.id != CHAT_ID:
-        return
-
-    existing = len(data["statuses"])
-
-    if existing >= STATUSES_COUNT:
-        await message.answer("   40 .")
-        return
-
-    for i in range(existing + 1, STATUSES_COUNT + 1):
-        status_id = str(i)
-
-        sent = await bot.send_photo(
-            chat_id=CHAT_ID,
-            photo=DEFAULT_PHOTO_URL,
-            caption=f" {status_id}\n\n "
-        )
-
-        data["statuses"][status_id] = {
-            "message_id": sent.message_id,
-            "photo": DEFAULT_PHOTO_URL,
-            "text": "",
-            "busy_until": None
-        }
-
-        save_data(data)
-        await asyncio.sleep(0.5)
-
-    await message.answer(".    40.")
-
-
-@dp.message(Command("reset"))
-async def reset(message: Message):
-    if message.chat.id != CHAT_ID:
-        return
-
-    data["statuses"] = {}
-    save_data(data)
-
-    await message.answer("  .   /setup.")
+    await message.answer("✅ Все статусы созданы")
 
 
 @dp.message(F.reply_to_message)
-async def handle_reply(message: Message):
-    if message.chat.id != CHAT_ID:
-        return
+async def reply_handler(message: Message):
+    replied = message.reply_to_message
 
-    replied_id = message.reply_to_message.message_id
-    status_id = find_status_by_message_id(replied_id)
+    status_id = find_status_by_message(replied.message_id)
 
     if not status_id:
         return
@@ -182,6 +140,7 @@ async def handle_reply(message: Message):
 
     if message.content_type == ContentType.PHOTO:
         file_id = message.photo[-1].file_id
+
         status["photo"] = file_id
         save_data(data)
 
@@ -191,11 +150,11 @@ async def handle_reply(message: Message):
                 message_id=status["message_id"],
                 media=InputMediaPhoto(
                     media=file_id,
-                    caption=make_caption(status_id)
-                )
+                    caption=make_caption(status_id),
+                ),
             )
-        except Exception as e:
-            await message.answer(f"   : {e}")
+        except Exception:
+            pass
 
         return
 
@@ -203,86 +162,82 @@ async def handle_reply(message: Message):
         return
 
     text = message.text.strip()
+        if text.startswith("+"):
+        status["text"] = text[1:].strip()
 
-
-    if text.lower() == "":
-        status["busy_until"] = int(time.time()) + 24 * 3600
-        status["text"] = " "
         save_data(data)
-        await edit_status(status_id)
+        await update_status_message(status_id)
         return
 
-    if text.lower() == " ":
+    if text == "0":
+        status["busy_until"] = None
+
+        save_data(data)
+        await update_status_message(status_id)
+        return
+
+    if text.lower() == "до утра":
         now = time.localtime()
-        tomorrow = time.mktime((
-            now.tm_year, now.tm_mon, now.tm_mday + 1,
-            8, 0, 0, 0, 0, -1
-        ))
-        status["busy_until"] = int(tomorrow)
+
+        tomorrow_8 = int(
+            time.mktime(
+                (
+                    now.tm_year,
+                    now.tm_mon,
+                    now.tm_mday + 1,
+                    8,
+                    0,
+                    0,
+                    0,
+                    0,
+                    -1,
+                )
+            )
+        )
+
+        status["busy_until"] = tomorrow_8
+
         save_data(data)
-        await edit_status(status_id)
+        await update_status_message(status_id)
         return
 
-    parts = text.split(maxsplit=1)
+    match = re.match(r"^(\d+)(?:\s+(\d+))?$", text)
 
-    if parts and parts[0].isdigit():
-        hours = int(parts[0])
+    if match:
+        hours = int(match.group(1))
 
-        if hours == 0:
-            status["busy_until"] = None
-            save_data(data)
-            await edit_status(status_id)
-            return
+        if match.group(2):
+            hours += int(match.group(2))
 
         status["busy_until"] = int(time.time()) + hours * 3600
+
         save_data(data)
-
-        await edit_status(status_id)
+        await update_status_message(status_id)
         return
-
-    if text.startswith("+"):
-        new_text = text[1:].strip()
-        status["text"] = new_text
-        save_data(data)
-
-        await edit_status(status_id)
-        return
-
-    await message.answer(
-        "  :\n"
-        "6    6 \n"
-        "0   \n"
-        "+     \n"
-        "   "
-    )
-
-
-async def timer_loop():
+        async def timer_loop():
     while True:
         now = int(time.time())
 
-        for status_id, status in list(data["statuses"].items()):
+        changed = False
+
+        for status_id, status in data["statuses"].items():
             busy_until = status.get("busy_until")
 
-            if busy_until:
-                if busy_until <= now:
-                    status["busy_until"] = None
-                    save_data(data)
-                    await edit_status(status_id)
-                else:
-                    await edit_status(status_id)
+            if busy_until and busy_until <= now:
+                status["busy_until"] = None
+
+                await update_status_message(status_id)
+                changed = True
+
+        if changed:
+            save_data(data)
 
         await asyncio.sleep(60)
 
 
 async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError(" BOT_TOKEN")
-
-    if CHAT_ID == 0:
-        raise RuntimeError(" CHAT_ID")
-
     asyncio.create_task(timer_loop())
+
     await dp.start_polling(bot)
 
 
