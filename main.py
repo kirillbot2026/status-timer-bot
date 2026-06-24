@@ -13,7 +13,7 @@ from aiogram.filters import Command
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 
-STATUSES_COUNT = 40
+STATUSES_COUNT = 55
 DATA_FILE = Path("statuses.json")
 
 DEFAULT_PHOTO_URL = os.getenv(
@@ -204,20 +204,22 @@ async def handle_reply(message: Message):
 
     text = message.text.strip()
 
-    if text.isdigit():
-        hours = int(text)
+parts = text.split(maxsplit=1)
 
-        if hours == 0:
-            status["busy_until"] = None
-            save_data(data)
-            await edit_status(status_id)
-            return
+if parts and parts[0].isdigit():
+    hours = int(parts[0])
 
-        status["busy_until"] = int(time.time()) + hours * 3600
+    if hours == 0:
+        status["busy_until"] = None
         save_data(data)
-
         await edit_status(status_id)
         return
+
+    status["busy_until"] = int(time.time()) + hours * 3600
+    save_data(data)
+
+    await edit_status(status_id)
+    return
 
     if text.startswith("+"):
         new_text = text[1:].strip()
