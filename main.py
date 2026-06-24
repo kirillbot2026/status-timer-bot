@@ -48,7 +48,7 @@ def format_left(seconds: int) -> str:
         seconds = 0
     hours = seconds // 3600
     minutes = (seconds % 3600) // 60
-    return f"{hours}ч {minutes:02d}м"
+    return f"{hours}С‡ {minutes:02d}Рј"
 
 
 def make_caption(status_id: str) -> str:
@@ -56,14 +56,14 @@ def make_caption(status_id: str) -> str:
     text = status.get("text", "")
     busy_until = status.get("busy_until")
 
-    lines = [f"Статус {status_id}", ""]
+    lines = [f"РЎС‚Р°С‚СѓСЃ {status_id}", ""]
 
     if busy_until and busy_until > int(time.time()):
         left = busy_until - int(time.time())
-        lines.append("🔴 Занят")
-        lines.append(f"Осталось: {format_left(left)}")
+        lines.append("рџ”ґ Р—Р°РЅСЏС‚")
+        lines.append(f"РћСЃС‚Р°Р»РѕСЃСЊ: {format_left(left)}")
     else:
-        lines.append("🟢 Свободен")
+        lines.append("рџџў РЎРІРѕР±РѕРґРµРЅ")
 
     if text:
         lines.append(text)
@@ -81,7 +81,7 @@ async def edit_status(status_id: str):
             caption=make_caption(status_id)
         )
     except Exception as e:
-        print(f"Ошибка обновления статуса {status_id}: {e}")
+        print(f"РћС€РёР±РєР° РѕР±РЅРѕРІР»РµРЅРёСЏ СЃС‚Р°С‚СѓСЃР° {status_id}: {e}")
 
 
 def find_status_by_message_id(message_id: int):
@@ -94,11 +94,11 @@ def find_status_by_message_id(message_id: int):
 @dp.message(Command("setup"))
 async def setup(message: Message):
     if message.chat.id != CHAT_ID:
-        await message.answer("Эту команду нужно писать в нужной группе.")
+        await message.answer("Р­С‚Сѓ РєРѕРјР°РЅРґСѓ РЅСѓР¶РЅРѕ РїРёСЃР°С‚СЊ РІ РЅСѓР¶РЅРѕР№ РіСЂСѓРїРїРµ.")
         return
 
     if data["statuses"]:
-        await message.answer("Статусы уже созданы. Если не все — напиши /continue.")
+        await message.answer("РЎС‚Р°С‚СѓСЃС‹ СѓР¶Рµ СЃРѕР·РґР°РЅС‹. Р•СЃР»Рё РЅРµ РІСЃРµ вЂ” РЅР°РїРёС€Рё /continue.")
         return
 
     for i in range(1, STATUSES_COUNT + 1):
@@ -107,7 +107,7 @@ async def setup(message: Message):
         sent = await bot.send_photo(
             chat_id=CHAT_ID,
             photo=DEFAULT_PHOTO_URL,
-            caption=f"Статус {status_id}\n\n🟢 Свободен"
+            caption=f"РЎС‚Р°С‚СѓСЃ {status_id}\n\nрџџў РЎРІРѕР±РѕРґРµРЅ"
         )
 
         data["statuses"][status_id] = {
@@ -120,7 +120,7 @@ async def setup(message: Message):
         save_data(data)
         await asyncio.sleep(0.5)
 
-    await message.answer("Готово. Создал 40 статусов.")
+    await message.answer("Р“РѕС‚РѕРІРѕ. РЎРѕР·РґР°Р» 40 СЃС‚Р°С‚СѓСЃРѕРІ.")
 
 
 @dp.message(Command("continue"))
@@ -131,7 +131,7 @@ async def continue_setup(message: Message):
     existing = len(data["statuses"])
 
     if existing >= STATUSES_COUNT:
-        await message.answer("Уже есть все 40 статусов.")
+        await message.answer("РЈР¶Рµ РµСЃС‚СЊ РІСЃРµ 40 СЃС‚Р°С‚СѓСЃРѕРІ.")
         return
 
     for i in range(existing + 1, STATUSES_COUNT + 1):
@@ -140,7 +140,7 @@ async def continue_setup(message: Message):
         sent = await bot.send_photo(
             chat_id=CHAT_ID,
             photo=DEFAULT_PHOTO_URL,
-            caption=f"Статус {status_id}\n\n🟢 Свободен"
+            caption=f"РЎС‚Р°С‚СѓСЃ {status_id}\n\nрџџў РЎРІРѕР±РѕРґРµРЅ"
         )
 
         data["statuses"][status_id] = {
@@ -153,7 +153,7 @@ async def continue_setup(message: Message):
         save_data(data)
         await asyncio.sleep(0.5)
 
-    await message.answer("Готово. Досоздал статусы до 40.")
+    await message.answer("Р“РѕС‚РѕРІРѕ. Р”РѕСЃРѕР·РґР°Р» СЃС‚Р°С‚СѓСЃС‹ РґРѕ 40.")
 
 
 @dp.message(Command("reset"))
@@ -164,7 +164,7 @@ async def reset(message: Message):
     data["statuses"] = {}
     save_data(data)
 
-    await message.answer("Список статусов очищен. Теперь напиши /setup.")
+    await message.answer("РЎРїРёСЃРѕРє СЃС‚Р°С‚СѓСЃРѕРІ РѕС‡РёС‰РµРЅ. РўРµРїРµСЂСЊ РЅР°РїРёС€Рё /setup.")
 
 
 @dp.message(F.reply_to_message)
@@ -195,7 +195,7 @@ async def handle_reply(message: Message):
                 )
             )
         except Exception as e:
-            await message.answer(f"Не смог заменить фото: {e}")
+            await message.answer(f"РќРµ СЃРјРѕРі Р·Р°РјРµРЅРёС‚СЊ С„РѕС‚Рѕ: {e}")
 
         return
 
@@ -204,22 +204,22 @@ async def handle_reply(message: Message):
 
     text = message.text.strip()
 
-parts = text.split(maxsplit=1)
+    parts = text.split(maxsplit=1)
 
-if parts and parts[0].isdigit():
-    hours = int(parts[0])
+    if parts and parts[0].isdigit():
+        hours = int(parts[0])
 
-    if hours == 0:
-        status["busy_until"] = None
+        if hours == 0:
+            status["busy_until"] = None
+            save_data(data)
+            await edit_status(status_id)
+            return
+
+        status["busy_until"] = int(time.time()) + hours * 3600
         save_data(data)
+
         await edit_status(status_id)
         return
-
-    status["busy_until"] = int(time.time()) + hours * 3600
-    save_data(data)
-
-    await edit_status(status_id)
-    return
 
     if text.startswith("+"):
         new_text = text[1:].strip()
@@ -230,11 +230,11 @@ if parts and parts[0].isdigit():
         return
 
     await message.answer(
-        "Ответь на статус:\n"
-        "6 — таймер на 6 часов\n"
-        "0 — сделать свободным\n"
-        "+ текст — изменить нижний текст\n"
-        "фото — изменить картинку"
+        "РћС‚РІРµС‚СЊ РЅР° СЃС‚Р°С‚СѓСЃ:\n"
+        "6 вЂ” С‚Р°Р№РјРµСЂ РЅР° 6 С‡Р°СЃРѕРІ\n"
+        "0 вЂ” СЃРґРµР»Р°С‚СЊ СЃРІРѕР±РѕРґРЅС‹Рј\n"
+        "+ С‚РµРєСЃС‚ вЂ” РёР·РјРµРЅРёС‚СЊ РЅРёР¶РЅРёР№ С‚РµРєСЃС‚\n"
+        "С„РѕС‚Рѕ вЂ” РёР·РјРµРЅРёС‚СЊ РєР°СЂС‚РёРЅРєСѓ"
     )
 
 
@@ -258,10 +258,10 @@ async def timer_loop():
 
 async def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Нет BOT_TOKEN")
+        raise RuntimeError("РќРµС‚ BOT_TOKEN")
 
     if CHAT_ID == 0:
-        raise RuntimeError("Нет CHAT_ID")
+        raise RuntimeError("РќРµС‚ CHAT_ID")
 
     asyncio.create_task(timer_loop())
     await dp.start_polling(bot)
