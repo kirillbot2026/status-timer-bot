@@ -68,7 +68,6 @@ def make_caption(status_id):
 
     if busy_until and busy_until > int(time.time()):
         left = busy_until - int(time.time())
-
         lines.append("🔴 Занят")
         lines.append(f"⏳ Осталось: {format_time_left(left)}")
     else:
@@ -103,7 +102,9 @@ def find_status_by_message(message_id):
             return status_id
 
     return None
-    @dp.message(Command("setup"))
+
+
+@dp.message(Command("setup"))
 async def setup_command(message: Message):
     if message.chat.id != CHAT_ID:
         return
@@ -162,7 +163,8 @@ async def reply_handler(message: Message):
         return
 
     text = message.text.strip()
-        if text.startswith("+"):
+
+    if text.startswith("+"):
         status["text"] = text[1:].strip()
 
         save_data(data)
@@ -214,7 +216,9 @@ async def reply_handler(message: Message):
         save_data(data)
         await update_status_message(status_id)
         return
-        async def timer_loop():
+
+
+async def timer_loop():
     while True:
         now = int(time.time())
 
@@ -237,7 +241,6 @@ async def reply_handler(message: Message):
 
 async def main():
     asyncio.create_task(timer_loop())
-
     await dp.start_polling(bot)
 
 
