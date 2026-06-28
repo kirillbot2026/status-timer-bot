@@ -1,12 +1,15 @@
 import asyncio
 import json
 import os
+import re
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ContentType
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import Message, InputMediaPhoto
 
@@ -14,11 +17,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 STATUSES_COUNT = 55
 DATA_FILE = Path(os.getenv("DATA_FILE", "statuses.json"))
-
-DEFAULT_PHOTO_URL = os.getenv(
-    "DEFAULT_PHOTO_URL",
-    "https://picsum.photos/900/600"
-)
+DEFAULT_PHOTO_URL = os.getenv("DEFAULT_PHOTO_URL", "https://picsum.photos/900/600")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -27,7 +26,6 @@ data_lock = asyncio.Lock()
 
 def load_data():
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-
     if DATA_FILE.exists():
         try:
             data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
@@ -47,10 +45,7 @@ data = load_data()
 
 def save_data():
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DATA_FILE.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+    DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def get_group(chat_id: int):
@@ -64,11 +59,9 @@ def get_group(chat_id: int):
         }
 
     group = data["groups"][group_id]
-
     group.setdefault("last_created", 0)
     group.setdefault("setup_running", False)
     group.setdefault("statuses", {})
-
     return group
 
 
@@ -79,11 +72,71 @@ def format_left(seconds: int) -> str:
     return f"{hours}ч {minutes:02d}м"
 
 
+def parse_duration_to_seconds(text: str):
+    text = text.lower().replace(",", " ").replace(".", " ")
+    tokens = re.findall(r"(\d+)\s*([а-яa-z]*)", text)
+
+    if not tokens:
+        return None
+
+    total_minutes = 0
+    seen_hours = False
+
+    for index, (num_str, unit) in enumerate(tokens):
+        num = int(num_str)
+        unit = unit.strip().lower()
+
+        if unit.startswith("м") or unit.startswith("min"):
+            total_minutes += num
+        elif unit.startswith("ч") or unit.startswith("h") or unit.startswith("час"):
+            total_minutes += num * 60
+            seen_hours = True
+        elif unit == "":
+            if index == 0:
+                total_minutes += num * 60
+                seen_hours = True
+            else:
+                if seen_hours:
+                    total_minutes += num
+                else:
+                    total_minutes += num * 60
+                    seen_hours = True
+
+    if total_minutes <= 0:
+        return None
+
+    return total_minutes * 60
+
+
+def seconds_until_moscow_10():
+    moscow = ZoneInfo("Europe/Moscow")
+    now = datetime.now(moscow)
+    target = now.replace(hour=10, minute=0, second=0, microsecond=0)
+
+    if now >= target:
+        target += timedelta(days=1)
+
+    return int((target - now).total_seconds())
+
+
+def sender_name(message: Message):
+    user = message.from_user
+
+    if not user:
+        return "Неизвестный"
+
+    if user.username:
+        return f"@{user.username}"
+
+    return user.full_name
+
+
 def make_caption(chat_id: int, status_id: str) -> str:
     group = get_group(chat_id)
     status = group["statuses"][status_id]
 
     busy_until = status.get("busy_until")
+    reservation_until = status.get("reservation_until")
     text = status.get("text", "")
     now = int(time.time())
 
@@ -95,10 +148,26 @@ def make_caption(chat_id: int, status_id: str) -> str:
     else:
         lines.append("🟢 Свободен")
 
+    if reservation_until and reservation_until > now:
+        lines.append(f"Бронь: {format_left(reservation_until - now)}")
+
     if text:
-        lines.extend(["", text])
+        lines.append(text)
 
     return "\n".join(lines)
+
+
+async def safe_answer(message: Message, text: str):
+    try:
+        await message.answer(text)
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after + 1)
+        try:
+            await message.answer(text)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 async def edit_status(chat_id: int, status_id: str, force: bool = False):
@@ -126,6 +195,10 @@ async def edit_status(chat_id: int, status_id: str, force: bool = False):
     except TelegramBadRequest as e:
         if "message is not modified" not in str(e).lower():
             print(f"Ошибка обновления статуса {status_id} в чате {chat_id}: {e}")
+
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after + 1)
+        await edit_status(chat_id, status_id, force=True)
 
     except Exception as e:
         print(f"Ошибка обновления статуса {status_id} в чате {chat_id}: {e}")
@@ -159,11 +232,11 @@ async def create_missing_statuses(message: Message):
         sync_last_created(group)
 
         if group["setup_running"]:
-            await message.answer("Создание статусов уже идёт. Подожди.")
+            await safe_answer(message, "Создание статусов уже идёт. Подожди.")
             return
 
         if group["last_created"] >= STATUSES_COUNT:
-            await message.answer("Уже есть все 55 статусов.")
+            await safe_answer(message, "Уже есть все 55 статусов.")
             return
 
         group["setup_running"] = True
@@ -189,18 +262,23 @@ async def create_missing_statuses(message: Message):
                     "photo": DEFAULT_PHOTO_URL,
                     "text": "",
                     "busy_until": None,
+                    "reservation_until": None,
                     "last_caption": caption
                 }
 
                 group["last_created"] = i
                 save_data()
 
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(1.2)
 
-        await message.answer("Готово. Статусы созданы до 55.")
+        await safe_answer(message, "Готово. Статусы созданы до 55.")
+
+    except TelegramRetryAfter as e:
+        print(f"Flood limit. Retry after {e.retry_after}")
+        await asyncio.sleep(e.retry_after + 1)
 
     except Exception as e:
-        await message.answer(f"Создание остановилось на ошибке. Напиши /continue.\n\nОшибка: {e}")
+        print(f"Создание остановилось: {e}")
 
     finally:
         async with data_lock:
@@ -215,7 +293,7 @@ async def setup(message: Message):
     sync_last_created(group)
 
     if group["last_created"] > 0:
-        await message.answer("Статусы уже есть. Если не все — напиши /continue.")
+        await safe_answer(message, "Статусы уже есть. Если не все — напиши /continue.")
         save_data()
         return
 
@@ -236,21 +314,25 @@ async def reset(message: Message):
         group["setup_running"] = False
         save_data()
 
-    await message.answer("База статусов этого чата очищена. Старые сообщения не удалены. Теперь напиши /setup.")
+    await safe_answer(message, "База очищена. Старые сообщения не удалены. Теперь напиши /setup.")
 
 
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
-    await message.answer(
+    await safe_answer(
+        message,
         "Команды:\n"
         "/setup — создать 55 статусов\n"
         "/continue — продолжить создание\n"
         "/reset — очистить базу этого чата\n\n"
         "Ответь на статус:\n"
         "6 — занять на 6 часов\n"
-        "12 — занять на 12 часов\n"
+        "6 текст — занять на 6 часов и поставить текст\n"
+        "6+2 — 6 часов + 2 часа подарок\n"
+        "До утра — занять до 10:00 по МСК\n"
+        "Бронь 1ч 30м — добавить бронь\n"
         "0 — сделать свободным\n"
-        "+ текст — изменить нижний текст\n"
+        "+текст — изменить нижний текст\n"
         "фото — заменить картинку"
     )
 
@@ -282,10 +364,7 @@ async def handle_reply(message: Message):
             await bot.edit_message_media(
                 chat_id=chat_id,
                 message_id=status["message_id"],
-                media=InputMediaPhoto(
-                    media=file_id,
-                    caption=caption
-                )
+                media=InputMediaPhoto(media=file_id, caption=caption)
             )
 
             async with data_lock:
@@ -293,7 +372,7 @@ async def handle_reply(message: Message):
                 save_data()
 
         except Exception as e:
-            await message.answer(f"Не смог заменить фото: {e}")
+            await safe_answer(message, f"Не смог заменить фото: {e}")
 
         return
 
@@ -301,47 +380,131 @@ async def handle_reply(message: Message):
         return
 
     text = message.text.strip()
+    text_lower = text.lower()
 
-    async with data_lock:
-        group = get_group(chat_id)
-        status = group["statuses"][status_id]
+    gift_match = re.fullmatch(r"(\d+)\s*\+\s*(\d+)", text)
 
-        if text.isdigit():
-            hours = int(text)
+    if gift_match:
+        base_hours = int(gift_match.group(1))
+        gift_hours = int(gift_match.group(2))
+        total_hours = base_hours + gift_hours
+
+        async with data_lock:
+            group = get_group(chat_id)
+            status = group["statuses"][status_id]
+            status["busy_until"] = int(time.time()) + total_hours * 3600
+            save_data()
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        await safe_answer(
+            message,
+            f"на {base_hours} часов + {gift_hours} часа подарок\n"
+            f"{sender_name(message)}"
+        )
+
+        await edit_status(chat_id, status_id, force=True)
+        return
+
+    if text_lower == "до утра":
+        seconds = seconds_until_moscow_10()
+
+        async with data_lock:
+            group = get_group(chat_id)
+            status = group["statuses"][status_id]
+            status["busy_until"] = int(time.time()) + seconds
+            save_data()
+
+        await edit_status(chat_id, status_id, force=True)
+        return
+
+    if text_lower.startswith("бронь"):
+        duration_text = text[5:].strip()
+        seconds = parse_duration_to_seconds(duration_text)
+
+        if not seconds:
+            await safe_answer(message, "Не понял время брони. Пример: Бронь 1ч 30м")
+            return
+
+        async with data_lock:
+            group = get_group(chat_id)
+            status = group["statuses"][status_id]
+            status["reservation_until"] = int(time.time()) + seconds
+            save_data()
+
+        await edit_status(chat_id, status_id, force=True)
+        return
+
+    if text.isdigit():
+        hours = int(text)
+
+        async with data_lock:
+            group = get_group(chat_id)
+            status = group["statuses"][status_id]
 
             if hours == 0:
                 status["busy_until"] = None
-                save_data()
-                force = True
             elif hours > 999:
-                await message.answer("Слишком большое число часов. Максимум 999.")
+                await safe_answer(message, "Слишком большое число часов. Максимум 999.")
                 return
             else:
                 status["busy_until"] = int(time.time()) + hours * 3600
-                save_data()
-                force = True
 
-        elif text.startswith("+"):
-            status["text"] = text[1:].strip()
             save_data()
-            force = True
 
-        else:
-            await message.answer(
-                "Ответь на статус:\n"
-                "6 — таймер на 6 часов\n"
-                "0 — сделать свободным\n"
-                "+ текст — изменить нижний текст\n"
-                "фото — изменить картинку"
-            )
-            return
+        await edit_status(chat_id, status_id, force=True)
+        return
 
-    await edit_status(chat_id, status_id, force=force)
+    timer_with_text = re.fullmatch(r"(\d+)\s+(.+)", text)
+
+    if timer_with_text:
+        hours = int(timer_with_text.group(1))
+        extra_text = timer_with_text.group(2)
+
+        async with data_lock:
+            group = get_group(chat_id)
+            status = group["statuses"][status_id]
+
+            if hours > 999:
+                await safe_answer(message, "Слишком большое число часов. Максимум 999.")
+                return
+
+            status["busy_until"] = int(time.time()) + hours * 3600
+            status["text"] = extra_text
+            save_data()
+
+        await edit_status(chat_id, status_id, force=True)
+        return
+
+    if text.startswith("+"):
+        async with data_lock:
+            group = get_group(chat_id)
+            status = group["statuses"][status_id]
+            status["text"] = text[1:]
+            save_data()
+
+        await edit_status(chat_id, status_id, force=True)
+        return
+
+    await safe_answer(
+        message,
+        "Ответь на статус:\n"
+        "6 — таймер на 6 часов\n"
+        "6+2 — подарок\n"
+        "До утра — до 10:00 МСК\n"
+        "Бронь 1ч 30м — бронь\n"
+        "0 — сделать свободным\n"
+        "+текст — изменить нижний текст"
+    )
 
 
 async def timer_loop():
     while True:
         to_edit = []
+        warnings = []
 
         async with data_lock:
             now = int(time.time())
@@ -350,20 +513,24 @@ async def timer_loop():
                 chat_id = int(chat_id_str)
 
                 for status_id, status in group["statuses"].items():
-                    busy_until = status.get("busy_until")
+                    changed = False
 
-                    if not busy_until:
-                        continue
+                    busy_until = status.get("busy_until")
+                    reservation_until = status.get("reservation_until")
+
+                    if busy_until and busy_until <= now:
+                        status["busy_until"] = None
+                        changed = True
+
+                    if reservation_until and reservation_until <= now:
+                        status["reservation_until"] = None
+                        changed = True
+                        warnings.append((chat_id, status_id))
 
                     old_caption = status.get("last_caption", "")
+                    new_caption = make_caption(chat_id, status_id)
 
-                    if busy_until <= now:
-                        status["busy_until"] = None
-                        new_caption = make_caption(chat_id, status_id)
-                    else:
-                        new_caption = make_caption(chat_id, status_id)
-
-                    if new_caption != old_caption:
+                    if changed or new_caption != old_caption:
                         to_edit.append((chat_id, status_id))
 
             save_data()
@@ -371,6 +538,18 @@ async def timer_loop():
         for chat_id, status_id in to_edit:
             await edit_status(chat_id, status_id, force=True)
             await asyncio.sleep(0.25)
+
+        for chat_id, status_id in warnings:
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ Пора выдать клиенту аккаунт.\nЛот: Статус {status_id}"
+                )
+                await asyncio.sleep(0.5)
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except Exception as e:
+                print(f"Не смог отправить предупреждение: {e}")
 
         await asyncio.sleep(60)
 
