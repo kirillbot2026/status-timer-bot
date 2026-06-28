@@ -26,6 +26,7 @@ data_lock = asyncio.Lock()
 
 def load_data():
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+
     if DATA_FILE.exists():
         try:
             data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
@@ -45,7 +46,10 @@ data = load_data()
 
 def save_data():
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    DATA_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
 
 
 def get_group(chat_id: int):
@@ -164,6 +168,27 @@ async def safe_answer(message: Message, text: str):
         await asyncio.sleep(e.retry_after + 1)
         try:
             await message.answer(text)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+async def safe_send_reply(chat_id: int, reply_to_message_id: int, text: str):
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_to_message_id=reply_to_message_id
+        )
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after + 1)
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_to_message_id=reply_to_message_id
+            )
         except Exception:
             pass
     except Exception:
@@ -321,30 +346,47 @@ async def reset(message: Message):
 async def help_cmd(message: Message):
     await safe_answer(
         message,
-        "Команды:\n"
+        "Функции бота:\n\n"
+        "Основные команды:\n"
         "/setup — создать 55 статусов\n"
-        "/continue — продолжить создание\n"
-        "/reset — очистить базу этого чата\n\n"
-        "Ответь на статус:\n"
-        "6 — занять на 6 часов\n"
-        "6 текст — занять на 6 часов и поставить текст\n"
-        "6+2 — 6 часов + 2 часа подарок\n"
-        "До утра — занять до 10:00 по МСК\n"
-        "Бронь 1ч 30м — добавить бронь\n"
-        "0 — сделать свободным\n"
-        "+текст — изменить нижний текст\n"
-        "фото — заменить картинку"
+        "/continue — продолжить создание, если остановилось\n"
+        "/reset — очистить базу этого чата\n"
+        "/help — показать помощь\n\n"
+        "Ответом на статус:\n"
+        "6 — занять статус на 6 часов\n"
+        "12 — занять статус на 12 часов\n"
+        "0 — сделать статус свободным\n"
+        "До утра — занять до 10:00 по МСК\n\n"
+        "Таймер + подарок:\n"
+        "6+2 — поставить 8 часов, удалить сообщение и написать ответом на статус:\n"
+        "на 6 часов + 2 часа подарок\n"
+        "ник человека\n\n"
+        "Таймер + обычный текст:\n"
+        "6 попка — поставить таймер на 6 часов, текст не менять\n"
+        "6 любой текст — поставить таймер на 6 часов, текст не менять\n\n"
+        "Таймер + нижний текст:\n"
+        "6 +попка — поставить 6 часов и нижний текст попка\n"
+        "12 +клиент Иван — поставить 12 часов и нижний текст клиент Иван\n\n"
+        "Нижний текст без таймера:\n"
+        "+не — поставить нижний текст не\n"
+        "+любой текст — изменить нижний текст\n\n"
+        "Бронь:\n"
+        "Бронь 3 часа — добавить бронь на 3 часа\n"
+        "Бронь 1ч 30м — добавить бронь на 1ч 30м\n"
+        "Бронь 40м — добавить бронь на 40 минут\n"
+        "Бронь 2 — добавить бронь на 2 часа\n\n"
+        "Фото:\n"
+        "Ответь фотографией на статус — заменить картинку статуса\n\n"
+        "Когда бронь закончится, бот уберёт строку брони и напишет предупреждение в чат."
     )
 
 
 @dp.message(F.reply_to_message, ~F.text.startswith("/"))
 async def handle_reply(message: Message):
     chat_id = message.chat.id
+    replied_message_id = message.reply_to_message.message_id
 
-    status_id = find_status_by_message_id(
-        chat_id,
-        message.reply_to_message.message_id
-    )
+    status_id = find_status_by_message_id(chat_id, replied_message_id)
 
     if not status_id:
         return
@@ -400,10 +442,13 @@ async def handle_reply(message: Message):
         except Exception:
             pass
 
-        await safe_answer(
-            message,
-            f"на {base_hours} часов + {gift_hours} часа подарок\n"
-            f"{sender_name(message)}"
+        await safe_send_reply(
+            chat_id=chat_id,
+            reply_to_message_id=replied_message_id,
+            text=(
+                f"на {base_hours} часов + {gift_hours} часа подарок\n"
+                f"{sender_name(message)}"
+            )
         )
 
         await edit_status(chat_id, status_id, force=True)
@@ -458,11 +503,11 @@ async def handle_reply(message: Message):
         await edit_status(chat_id, status_id, force=True)
         return
 
-    timer_with_text = re.fullmatch(r"(\d+)\s+(.+)", text)
+    timer_with_plus_text = re.fullmatch(r"(\d+)\s+\+(.+)", text)
 
-    if timer_with_text:
-        hours = int(timer_with_text.group(1))
-        extra_text = timer_with_text.group(2)
+    if timer_with_plus_text:
+        hours = int(timer_with_plus_text.group(1))
+        extra_text = timer_with_plus_text.group(2)
 
         async with data_lock:
             group = get_group(chat_id)
@@ -474,6 +519,25 @@ async def handle_reply(message: Message):
 
             status["busy_until"] = int(time.time()) + hours * 3600
             status["text"] = extra_text
+            save_data()
+
+        await edit_status(chat_id, status_id, force=True)
+        return
+
+    timer_with_any_text = re.fullmatch(r"(\d+)\s+(.+)", text)
+
+    if timer_with_any_text:
+        hours = int(timer_with_any_text.group(1))
+
+        async with data_lock:
+            group = get_group(chat_id)
+            status = group["statuses"][status_id]
+
+            if hours > 999:
+                await safe_answer(message, "Слишком большое число часов. Максимум 999.")
+                return
+
+            status["busy_until"] = int(time.time()) + hours * 3600
             save_data()
 
         await edit_status(chat_id, status_id, force=True)
@@ -491,13 +555,7 @@ async def handle_reply(message: Message):
 
     await safe_answer(
         message,
-        "Ответь на статус:\n"
-        "6 — таймер на 6 часов\n"
-        "6+2 — подарок\n"
-        "До утра — до 10:00 МСК\n"
-        "Бронь 1ч 30м — бронь\n"
-        "0 — сделать свободным\n"
-        "+текст — изменить нижний текст"
+        "Не понял команду. Напиши /help"
     )
 
 
