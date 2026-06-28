@@ -25,33 +25,32 @@ dp = Dispatcher()
 data_lock = asyncio.Lock()
 
 
-def save_data(data):
-    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DATA_FILE.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-
-
 def load_data():
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     if DATA_FILE.exists():
         try:
-            return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            loaded = json.loads(DATA_FILE.read_text(encoding="utf-8"))
         except Exception:
-            pass
+            loaded = {}
+    else:
+        loaded = {}
 
-    data = {"chats": {}}
-    save_data(data)
-    return data
+    if "chats" not in loaded:
+        loaded["chats"] = {}
+
+    return loaded
 
 
 data = load_data()
 
-if "chats" not in data:
-    data = {"chats": {}}
-    save_data(data)
+
+def save_data():
+    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DATA_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
 
 
 def chat_key(chat_id: int) -> str:
@@ -65,6 +64,23 @@ def get_chat_data(chat_id: int):
         data["chats"][key] = {"statuses": {}}
 
     return data["chats"][key]
+
+
+def migrate_old_statuses_to_chat(chat_id: int):
+    key = chat_key(chat_id)
+
+    if key not in data["chats"]:
+        data["chats"][key] = {"statuses": {}}
+
+    if data["chats"][key]["statuses"]:
+        return
+
+    old_statuses = data.get("statuses")
+
+    if isinstance(old_statuses, dict) and old_statuses:
+        data["chats"][key]["statuses"] = old_statuses
+        data["statuses"] = {}
+        save_data()
 
 
 def format_left(seconds: int) -> str:
@@ -116,7 +132,7 @@ async def edit_status(chat_id: int, status_id: str, force: bool = False):
         )
 
         status["last_caption"] = caption
-        save_data(data)
+        save_data()
 
     except TelegramBadRequest as e:
         if "message is not modified" not in str(e).lower():
@@ -136,13 +152,24 @@ def find_status_by_message_id(chat_id: int, message_id: int):
     return None
 
 
+def get_existing_numbers(chat_data):
+    nums = []
+
+    for key in chat_data["statuses"].keys():
+        if str(key).isdigit():
+            nums.append(int(key))
+
+    return nums
+
+
 @dp.message(Command("setup"))
 async def setup(message: Message):
     async with data_lock:
+        migrate_old_statuses_to_chat(message.chat.id)
         chat_data = get_chat_data(message.chat.id)
 
         if chat_data["statuses"]:
-            await message.answer("Статусы уже созданы. Если не все — напиши /continue.")
+            await message.answer("Статусы уже есть. Если не все — напиши /continue.")
             return
 
         for i in range(1, STATUSES_COUNT + 1):
@@ -163,7 +190,7 @@ async def setup(message: Message):
                 "last_caption": caption
             }
 
-            save_data(data)
+            save_data()
             await asyncio.sleep(0.5)
 
     await message.answer("Готово. Создал 55 статусов.")
@@ -172,14 +199,21 @@ async def setup(message: Message):
 @dp.message(Command("continue"))
 async def continue_setup(message: Message):
     async with data_lock:
+        migrate_old_statuses_to_chat(message.chat.id)
         chat_data = get_chat_data(message.chat.id)
-        existing = len(chat_data["statuses"])
 
-        if existing >= STATUSES_COUNT:
+        existing_numbers = get_existing_numbers(chat_data)
+
+        if existing_numbers:
+            start_from = max(existing_numbers) + 1
+        else:
+            start_from = 1
+
+        if start_from > STATUSES_COUNT:
             await message.answer("Уже есть все 55 статусов.")
             return
 
-        for i in range(existing + 1, STATUSES_COUNT + 1):
+        for i in range(start_from, STATUSES_COUNT + 1):
             status_id = str(i)
             caption = f"Статус {status_id}\n\n🟢 Свободен"
 
@@ -197,7 +231,7 @@ async def continue_setup(message: Message):
                 "last_caption": caption
             }
 
-            save_data(data)
+            save_data()
             await asyncio.sleep(0.5)
 
     await message.answer("Готово. Досоздал статусы до 55.")
@@ -208,9 +242,9 @@ async def reset(message: Message):
     async with data_lock:
         chat_data = get_chat_data(message.chat.id)
         chat_data["statuses"] = {}
-        save_data(data)
+        save_data()
 
-    await message.answer("Список статусов в этом чате очищен. Теперь напиши /setup.")
+    await message.answer("База статусов этого чата очищена. Старые сообщения не удалены. Теперь напиши /setup.")
 
 
 @dp.message(Command("help"))
@@ -230,22 +264,24 @@ async def help_cmd(message: Message):
     )
 
 
-@dp.message(F.reply_to_message)
+@dp.message(F.reply_to_message, ~F.text.startswith("/"))
 async def handle_reply(message: Message):
-    replied_id = message.reply_to_message.message_id
-    status_id = find_status_by_message_id(message.chat.id, replied_id)
-
-    if not status_id:
-        return
-
     async with data_lock:
+        migrate_old_statuses_to_chat(message.chat.id)
+
+        replied_id = message.reply_to_message.message_id
+        status_id = find_status_by_message_id(message.chat.id, replied_id)
+
+        if not status_id:
+            return
+
         chat_data = get_chat_data(message.chat.id)
         status = chat_data["statuses"][status_id]
 
         if message.content_type == ContentType.PHOTO:
             file_id = message.photo[-1].file_id
             status["photo"] = file_id
-            save_data(data)
+            save_data()
 
             try:
                 caption = make_caption(message.chat.id, status_id)
@@ -260,7 +296,7 @@ async def handle_reply(message: Message):
                 )
 
                 status["last_caption"] = caption
-                save_data(data)
+                save_data()
 
             except Exception as e:
                 await message.answer(f"Не смог заменить фото: {e}")
@@ -277,7 +313,7 @@ async def handle_reply(message: Message):
 
             if hours == 0:
                 status["busy_until"] = None
-                save_data(data)
+                save_data()
                 await edit_status(message.chat.id, status_id, force=True)
                 return
 
@@ -286,14 +322,14 @@ async def handle_reply(message: Message):
                 return
 
             status["busy_until"] = int(time.time()) + hours * 3600
-            save_data(data)
+            save_data()
 
             await edit_status(message.chat.id, status_id, force=True)
             return
 
         if text.startswith("+"):
             status["text"] = text[1:].strip()
-            save_data(data)
+            save_data()
             await edit_status(message.chat.id, status_id, force=True)
             return
 
@@ -308,6 +344,8 @@ async def handle_reply(message: Message):
 
 async def timer_loop():
     while True:
+        to_edit = []
+
         async with data_lock:
             now = int(time.time())
 
@@ -322,12 +360,19 @@ async def timer_loop():
 
                     if busy_until <= now:
                         status["busy_until"] = None
-                        save_data(data)
-                        await edit_status(chat_id, status_id, force=True)
+                        to_edit.append((chat_id, status_id, True))
                     else:
-                        await edit_status(chat_id, status_id)
+                        old_caption = status.get("last_caption", "")
+                        new_caption = make_caption(chat_id, status_id)
 
-                    await asyncio.sleep(0.1)
+                        if new_caption != old_caption:
+                            to_edit.append((chat_id, status_id, True))
+
+            save_data()
+
+        for chat_id, status_id, force in to_edit:
+            await edit_status(chat_id, status_id, force=force)
+            await asyncio.sleep(0.2)
 
         await asyncio.sleep(60)
 
