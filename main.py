@@ -483,6 +483,32 @@ async def handle_reply(message: Message):
         await edit_status(chat_id, status_id, force=True)
         return
 
+    # Формат 6:30 = 6 часов 30 минут
+time_match = re.fullmatch(r"(\d+):(\d{1,2})", text)
+
+if time_match:
+    hours = int(time_match.group(1))
+    minutes = int(time_match.group(2))
+
+    if minutes >= 60:
+        await safe_answer(message, "Минут должно быть меньше 60.")
+        return
+
+    async with data_lock:
+        group = get_group(chat_id)
+        status = group["statuses"][status_id]
+
+        status["busy_until"] = (
+            int(time.time())
+            + hours * 3600
+            + minutes * 60
+        )
+
+        save_data()
+
+    await edit_status(chat_id, status_id, force=True)
+    return
+
     if text.isdigit():
         hours = int(text)
 
