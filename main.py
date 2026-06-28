@@ -58,36 +58,18 @@ def get_group(chat_id: int):
 
     if group_id not in data["groups"]:
         data["groups"][group_id] = {
+            "last_created": 0,
             "setup_running": False,
             "statuses": {}
         }
 
-    if "setup_running" not in data["groups"][group_id]:
-        data["groups"][group_id]["setup_running"] = False
+    group = data["groups"][group_id]
 
-    if "statuses" not in data["groups"][group_id]:
-        data["groups"][group_id]["statuses"] = {}
+    group.setdefault("last_created", 0)
+    group.setdefault("setup_running", False)
+    group.setdefault("statuses", {})
 
-    return data["groups"][group_id]
-
-
-def get_status_numbers(group):
-    numbers = []
-
-    for key in group["statuses"].keys():
-        if str(key).isdigit():
-            numbers.append(int(key))
-
-    return sorted(numbers)
-
-
-def next_status_number(group):
-    numbers = get_status_numbers(group)
-
-    if not numbers:
-        return 1
-
-    return max(numbers) + 1
+    return group
 
 
 def format_left(seconds: int) -> str:
@@ -159,22 +141,34 @@ def find_status_by_message_id(chat_id: int, message_id: int):
     return None
 
 
-async def create_statuses(message: Message):
+def sync_last_created(group):
+    max_number = 0
+
+    for key in group["statuses"].keys():
+        if str(key).isdigit():
+            max_number = max(max_number, int(key))
+
+    group["last_created"] = max(group.get("last_created", 0), max_number)
+
+
+async def create_missing_statuses(message: Message):
     chat_id = message.chat.id
-    group = get_group(chat_id)
 
-    if group["setup_running"]:
-        await message.answer("Создание статусов уже идёт. Подожди.")
-        return
+    async with data_lock:
+        group = get_group(chat_id)
+        sync_last_created(group)
 
-    start_from = next_status_number(group)
+        if group["setup_running"]:
+            await message.answer("Создание статусов уже идёт. Подожди.")
+            return
 
-    if start_from > STATUSES_COUNT:
-        await message.answer("Уже есть все 55 статусов.")
-        return
+        if group["last_created"] >= STATUSES_COUNT:
+            await message.answer("Уже есть все 55 статусов.")
+            return
 
-    group["setup_running"] = True
-    save_data()
+        group["setup_running"] = True
+        start_from = group["last_created"] + 1
+        save_data()
 
     try:
         for i in range(start_from, STATUSES_COUNT + 1):
@@ -187,46 +181,60 @@ async def create_statuses(message: Message):
                 caption=caption
             )
 
-            group["statuses"][status_id] = {
-                "message_id": sent.message_id,
-                "photo": DEFAULT_PHOTO_URL,
-                "text": "",
-                "busy_until": None,
-                "last_caption": caption
-            }
+            async with data_lock:
+                group = get_group(chat_id)
 
-            save_data()
-            await asyncio.sleep(0.5)
+                group["statuses"][status_id] = {
+                    "message_id": sent.message_id,
+                    "photo": DEFAULT_PHOTO_URL,
+                    "text": "",
+                    "busy_until": None,
+                    "last_caption": caption
+                }
+
+                group["last_created"] = i
+                save_data()
+
+            await asyncio.sleep(0.6)
+
+        await message.answer("Готово. Статусы созданы до 55.")
+
+    except Exception as e:
+        await message.answer(f"Создание остановилось на ошибке. Напиши /continue.\n\nОшибка: {e}")
 
     finally:
-        group["setup_running"] = False
-        save_data()
-
-    await message.answer("Готово. Статусы созданы до 55.")
+        async with data_lock:
+            group = get_group(chat_id)
+            group["setup_running"] = False
+            save_data()
 
 
 @dp.message(Command("setup"))
 async def setup(message: Message):
     group = get_group(message.chat.id)
+    sync_last_created(group)
 
-    if group["statuses"]:
+    if group["last_created"] > 0:
         await message.answer("Статусы уже есть. Если не все — напиши /continue.")
+        save_data()
         return
 
-    await create_statuses(message)
+    await create_missing_statuses(message)
 
 
 @dp.message(Command("continue"))
 async def continue_setup(message: Message):
-    await create_statuses(message)
+    await create_missing_statuses(message)
 
 
 @dp.message(Command("reset"))
 async def reset(message: Message):
-    group = get_group(message.chat.id)
-    group["statuses"] = {}
-    group["setup_running"] = False
-    save_data()
+    async with data_lock:
+        group = get_group(message.chat.id)
+        group["statuses"] = {}
+        group["last_created"] = 0
+        group["setup_running"] = False
+        save_data()
 
     await message.answer("База статусов этого чата очищена. Старые сообщения не удалены. Теперь напиши /setup.")
 
@@ -250,6 +258,7 @@ async def help_cmd(message: Message):
 @dp.message(F.reply_to_message, ~F.text.startswith("/"))
 async def handle_reply(message: Message):
     chat_id = message.chat.id
+
     status_id = find_status_by_message_id(
         chat_id,
         message.reply_to_message.message_id
@@ -258,13 +267,14 @@ async def handle_reply(message: Message):
     if not status_id:
         return
 
-    group = get_group(chat_id)
-    status = group["statuses"][status_id]
-
     if message.content_type == ContentType.PHOTO:
         file_id = message.photo[-1].file_id
-        status["photo"] = file_id
-        save_data()
+
+        async with data_lock:
+            group = get_group(chat_id)
+            status = group["statuses"][status_id]
+            status["photo"] = file_id
+            save_data()
 
         try:
             caption = make_caption(chat_id, status_id)
@@ -278,8 +288,9 @@ async def handle_reply(message: Message):
                 )
             )
 
-            status["last_caption"] = caption
-            save_data()
+            async with data_lock:
+                status["last_caption"] = caption
+                save_data()
 
         except Exception as e:
             await message.answer(f"Не смог заменить фото: {e}")
@@ -291,70 +302,75 @@ async def handle_reply(message: Message):
 
     text = message.text.strip()
 
-    if text.isdigit():
-        hours = int(text)
+    async with data_lock:
+        group = get_group(chat_id)
+        status = group["statuses"][status_id]
 
-        if hours == 0:
-            status["busy_until"] = None
+        if text.isdigit():
+            hours = int(text)
+
+            if hours == 0:
+                status["busy_until"] = None
+                save_data()
+                force = True
+            elif hours > 999:
+                await message.answer("Слишком большое число часов. Максимум 999.")
+                return
+            else:
+                status["busy_until"] = int(time.time()) + hours * 3600
+                save_data()
+                force = True
+
+        elif text.startswith("+"):
+            status["text"] = text[1:].strip()
             save_data()
-            await edit_status(chat_id, status_id, force=True)
+            force = True
+
+        else:
+            await message.answer(
+                "Ответь на статус:\n"
+                "6 — таймер на 6 часов\n"
+                "0 — сделать свободным\n"
+                "+ текст — изменить нижний текст\n"
+                "фото — изменить картинку"
+            )
             return
 
-        if hours > 999:
-            await message.answer("Слишком большое число часов. Максимум 999.")
-            return
-
-        status["busy_until"] = int(time.time()) + hours * 3600
-        save_data()
-
-        await edit_status(chat_id, status_id, force=True)
-        return
-
-    if text.startswith("+"):
-        status["text"] = text[1:].strip()
-        save_data()
-        await edit_status(chat_id, status_id, force=True)
-        return
-
-    await message.answer(
-        "Ответь на статус:\n"
-        "6 — таймер на 6 часов\n"
-        "0 — сделать свободным\n"
-        "+ текст — изменить нижний текст\n"
-        "фото — изменить картинку"
-    )
+    await edit_status(chat_id, status_id, force=force)
 
 
 async def timer_loop():
     while True:
         to_edit = []
 
-        now = int(time.time())
+        async with data_lock:
+            now = int(time.time())
 
-        for chat_id_str, group in data["groups"].items():
-            chat_id = int(chat_id_str)
+            for chat_id_str, group in data["groups"].items():
+                chat_id = int(chat_id_str)
 
-            for status_id, status in group["statuses"].items():
-                busy_until = status.get("busy_until")
+                for status_id, status in group["statuses"].items():
+                    busy_until = status.get("busy_until")
 
-                if not busy_until:
-                    continue
+                    if not busy_until:
+                        continue
 
-                old_caption = status.get("last_caption", "")
-                new_caption = make_caption(chat_id, status_id)
+                    old_caption = status.get("last_caption", "")
 
-                if busy_until <= now:
-                    status["busy_until"] = None
-                    new_caption = make_caption(chat_id, status_id)
+                    if busy_until <= now:
+                        status["busy_until"] = None
+                        new_caption = make_caption(chat_id, status_id)
+                    else:
+                        new_caption = make_caption(chat_id, status_id)
 
-                if new_caption != old_caption:
-                    to_edit.append((chat_id, status_id))
+                    if new_caption != old_caption:
+                        to_edit.append((chat_id, status_id))
 
-        save_data()
+            save_data()
 
         for chat_id, status_id in to_edit:
             await edit_status(chat_id, status_id, force=True)
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.25)
 
         await asyncio.sleep(60)
 
