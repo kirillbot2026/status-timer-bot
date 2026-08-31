@@ -1,529 +1,917 @@
-import asyncio, json, os, re, time
+import asyncio
+import json
+import logging
+import os
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ContentType
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.filters import Command
-from aiogram.types import Message, InputMediaPhoto
+from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-STATUSES_COUNT = 55
-DATA_FILE = Path(os.getenv("DATA_FILE", "statuses.json"))
-DEFAULT_PHOTO_URL = os.getenv("DEFAULT_PHOTO_URL", "https://picsum.photos/900/600")
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-data_lock = asyncio.Lock()
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
+
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+
+SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])
+TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])
+
+# Сейчас учитываем только аккаунты 1-50
+MIN_ACCOUNT = 1
+MAX_ACCOUNT = 50
+
+# Как часто обновлять итоговое сообщение
+UPDATE_INTERVAL = 60
+
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+
+DATA_FILE = DATA_DIR / "statuses.json"
+
+
+# ============================================================
+# ЛОГИ
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger("status_aggregator")
+
+
+# ============================================================
+# СОСТОЯНИЕ
+# ============================================================
+
+statuses = {}
+
+# ID сообщения с общей сводкой во второй группе
+summary_message_id = None
+
+# Чтобы не редактировать сообщение без необходимости
+last_rendered_text = None
+
+
+# ============================================================
+# TELEGRAM CLIENT
+# ============================================================
+
+client = TelegramClient(
+    "status_aggregator_bot",
+    API_ID,
+    API_HASH,
+)
+
+
+# ============================================================
+# СОХРАНЕНИЕ
+# ============================================================
+
+def save_data():
+    data = {
+        "statuses": statuses,
+        "summary_message_id": summary_message_id,
+    }
+
+    tmp_file = DATA_FILE.with_suffix(".tmp")
+
+    with tmp_file.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    tmp_file.replace(DATA_FILE)
 
 
 def load_data():
-    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if DATA_FILE.exists():
-        try:
-            d = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            d = {}
-    else:
-        d = {}
-    if "groups" not in d:
-        d = {"groups": {}}
-    return d
+    global statuses
+    global summary_message_id
+
+    if not DATA_FILE.exists():
+        logger.info("Файл состояния ещё не существует.")
+        return
+
+    try:
+        with DATA_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        statuses = data.get("statuses", {})
+        summary_message_id = data.get("summary_message_id")
+
+        logger.info(
+            "Состояние загружено: %s аккаунтов",
+            len(statuses),
+        )
+
+    except Exception:
+        logger.exception("Ошибка загрузки statuses.json")
 
 
-data = load_data()
+# ============================================================
+# ПОИСК НОМЕРА АККАУНТА
+# ============================================================
 
+def extract_account_number(text: str):
+    """
+    Ищет:
+        Аккаунт 10
+        Аккаунт №10
+        Аккаунт #10
+        Account 10
+        ACCOUNT 10
+    """
 
-def save_data():
-    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def get_group(chat_id: int):
-    gid = str(chat_id)
-    if gid not in data["groups"]:
-        data["groups"][gid] = {"last_created": 0, "setup_running": False, "statuses": {}}
-    g = data["groups"][gid]
-    g.setdefault("last_created", 0)
-    g.setdefault("setup_running", False)
-    g.setdefault("statuses", {})
-    return g
-
-
-def format_left(sec: int):
-    sec = max(0, sec)
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    return f"{h}ч {m:02d}м"
-
-
-def parse_duration_to_seconds(text: str):
-    text = text.lower().replace(",", " ").replace(".", " ")
-    tokens = re.findall(r"(\d+)\s*([а-яa-z]*)", text)
-    if not tokens:
+    if not text:
         return None
 
-    total = 0
-    seen_hours = False
+    patterns = [
+        r"\bаккаунт\s*[№#:]?\s*(\d+)\b",
+        r"\baccount\s*[№#:]?\s*(\d+)\b",
+    ]
 
-    for i, (num_s, unit) in enumerate(tokens):
-        n = int(num_s)
-        unit = unit.lower()
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
 
-        if unit.startswith("м") or unit.startswith("min"):
-            total += n
-        elif unit.startswith("ч") or unit.startswith("h") or unit.startswith("час"):
-            total += n * 60
-            seen_hours = True
-        elif unit == "":
-            if i == 0:
-                total += n * 60
-                seen_hours = True
-            else:
-                total += n if seen_hours else n * 60
+        if match:
+            number = int(match.group(1))
 
-    return total * 60 if total > 0 else None
+            if MIN_ACCOUNT <= number <= MAX_ACCOUNT:
+                return number
 
-
-def seconds_until_moscow_10():
-    tz = ZoneInfo("Europe/Moscow")
-    now = datetime.now(tz)
-    target = now.replace(hour=10, minute=0, second=0, microsecond=0)
-    if now >= target:
-        target += timedelta(days=1)
-    return int((target - now).total_seconds())
+    return None
 
 
-def sender_name(message: Message):
-    u = message.from_user
-    if not u:
-        return "Неизвестный"
-    return f"@{u.username}" if u.username else u.full_name
+# ============================================================
+# ПАРСИНГ ТАЙМЕРА
+# ============================================================
+
+def parse_duration(text: str):
+    """
+    Поддерживает:
+
+    22ч
+    22 ч
+    2ч 52м
+    1д 11ч
+    1д 11ч 20м
+    49м
+    1д
+    2 часа
+    30 минут
+
+    Возвращает timedelta или None.
+    """
+
+    if not text:
+        return None
+
+    total_seconds = 0
+
+    # Дни
+    day_match = re.search(
+        r"(\d+)\s*(?:д|дн|день|дня|дней)",
+        text,
+        re.IGNORECASE,
+    )
+
+    if day_match:
+        total_seconds += int(day_match.group(1)) * 86400
+
+    # Часы
+    hour_match = re.search(
+        r"(\d+)\s*(?:ч|час|часа|часов)",
+        text,
+        re.IGNORECASE,
+    )
+
+    if hour_match:
+        total_seconds += int(hour_match.group(1)) * 3600
+
+    # Минуты
+    minute_match = re.search(
+        r"(\d+)\s*(?:м|мин|минута|минуты|минут)",
+        text,
+        re.IGNORECASE,
+    )
+
+    if minute_match:
+        total_seconds += int(minute_match.group(1)) * 60
+
+    if total_seconds <= 0:
+        return None
+
+    return timedelta(seconds=total_seconds)
 
 
-def make_caption(chat_id: int, status_id: str):
-    g = get_group(chat_id)
-    s = g["statuses"][status_id]
-    now = int(time.time())
+# ============================================================
+# ОПРЕДЕЛЕНИЕ СТАТУСА
+# ============================================================
 
-    busy_until = s.get("busy_until")
-    reservation_until = s.get("reservation_until")
-    text = s.get("text", "")
+def detect_status(text: str):
+    """
+    Возвращает:
+        free
+        occupied
+        metro_ban
+        unavailable
+        inactive
+        None
+    """
 
-    lines = [f"Статус {status_id}", ""]
+    if not text:
+        return None
 
-    if busy_until and busy_until > now:
-        lines.append("🔴 Занят")
-        lines.append(f"Осталось: {format_left(busy_until - now)}")
+    lower = text.lower()
+
+    # Сначала проверяем бан метро,
+    # потому что там одновременно может быть слово "свободен".
+    if (
+        "бан метро" in lower
+        or "🟡 бан метро" in lower
+    ):
+        return "metro_ban"
+
+    # Обычный бан
+    if re.search(
+        r"(?:^|\n)\s*(?:⚫\s*)?бан(?:\s|$)",
+        lower,
+        re.IGNORECASE,
+    ):
+        return "unavailable"
+
+    # Занят
+    if re.search(
+        r"(?:^|\n)\s*(?:🔴\s*)?занят(?:\s|$)",
+        lower,
+        re.IGNORECASE,
+    ):
+        return "occupied"
+
+    # Свободен
+    if re.search(
+        r"(?:^|\n)\s*(?:🟢\s*)?свободен(?:\s|$)",
+        lower,
+        re.IGNORECASE,
+    ):
+        return "free"
+
+    # Неактивен
+    if "неактив" in lower:
+        return "inactive"
+
+    return None
+
+
+# ============================================================
+# ПОЛУЧЕНИЕ ССЫЛКИ НА СООБЩЕНИЕ
+# ============================================================
+
+def make_source_message_link(message_id: int):
+    """
+    Для закрытой супергруппы:
+
+    -1001234567890
+          ↓
+    1234567890
+
+    Telegram message link:
+    https://t.me/c/1234567890/MESSAGE_ID
+    """
+
+    chat_id_string = str(abs(SOURCE_CHAT_ID))
+
+    if chat_id_string.startswith("100"):
+        internal_id = chat_id_string[3:]
     else:
-        lines.append("🟢 Свободен")
+        internal_id = chat_id_string
 
-    if reservation_until and reservation_until > now:
-        lines.append(f"Бронь: {format_left(reservation_until - now)}")
+    return f"https://t.me/c/{internal_id}/{message_id}"
 
-    if text:
-        lines.append(text)
+
+# ============================================================
+# ОБНОВЛЕНИЕ АККАУНТА
+# ============================================================
+
+def process_message(message):
+    global statuses
+
+    text = message.raw_text or ""
+
+    account = extract_account_number(text)
+
+    if account is None:
+        return False
+
+    status = detect_status(text)
+
+    if status is None:
+        return False
+
+    # Неактивный сейчас не выводим.
+    # Но аккаунт всё равно может существовать.
+    if status == "inactive":
+        if str(account) in statuses:
+            statuses[str(account)]["status"] = "inactive"
+            statuses[str(account)]["expires_at"] = None
+            statuses[str(account)]["source_message_id"] = message.id
+            statuses[str(account)]["source_link"] = make_source_message_link(
+                message.id
+            )
+            save_data()
+
+        logger.info(
+            "ACCOUNT %s: НЕАКТИВЕН (не выводится)",
+            account,
+        )
+
+        return True
+
+    duration = parse_duration(text)
+
+    expires_at = None
+
+    if duration:
+        expires_at = (
+            datetime.now(timezone.utc) + duration
+        ).isoformat()
+
+    source_link = make_source_message_link(message.id)
+
+    statuses[str(account)] = {
+        "account": account,
+        "status": status,
+        "expires_at": expires_at,
+        "source_message_id": message.id,
+        "source_link": source_link,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    save_data()
+
+    logger.info(
+        "ACCOUNT %s -> %s | timer=%s | message=%s",
+        account,
+        status,
+        duration,
+        message.id,
+    )
+
+    return True
+
+
+# ============================================================
+# ПРОВЕРКА ИСТЁКШИХ ТАЙМЕРОВ
+# ============================================================
+
+def normalize_expired_statuses():
+    changed = False
+
+    now = datetime.now(timezone.utc)
+
+    for account, item in statuses.items():
+
+        expires_at = item.get("expires_at")
+
+        if not expires_at:
+            continue
+
+        try:
+            expires = datetime.fromisoformat(expires_at)
+
+        except Exception:
+            item["expires_at"] = None
+            changed = True
+            continue
+
+        if now >= expires:
+
+            # После окончания любого таймера
+            # аккаунт становится свободным.
+            if item.get("status") != "free":
+                item["status"] = "free"
+                item["expires_at"] = None
+                changed = True
+
+                logger.info(
+                    "ACCOUNT %s -> таймер закончился -> СВОБОДЕН",
+                    account,
+                )
+
+    if changed:
+        save_data()
+
+    return changed
+
+
+# ============================================================
+# ФОРМАТИРОВАНИЕ ОСТАВШЕГОСЯ ВРЕМЕНИ
+# ============================================================
+
+def format_remaining(expires_at):
+    if not expires_at:
+        return ""
+
+    try:
+        expires = datetime.fromisoformat(expires_at)
+
+    except Exception:
+        return ""
+
+    now = datetime.now(timezone.utc)
+
+    remaining = expires - now
+
+    if remaining.total_seconds() <= 0:
+        return ""
+
+    total_seconds = int(remaining.total_seconds())
+
+    days = total_seconds // 86400
+    total_seconds %= 86400
+
+    hours = total_seconds // 3600
+    total_seconds %= 3600
+
+    minutes = total_seconds // 60
+
+    parts = []
+
+    if days:
+        parts.append(f"{days}д")
+
+    if hours:
+        parts.append(f"{hours}ч")
+
+    # Показываем минуты, если меньше суток
+    # или если они есть.
+    if minutes or not parts:
+        parts.append(f"{minutes}м")
+
+    return " ".join(parts)
+
+
+# ============================================================
+# ТЕКСТ ОДНОЙ СТРОКИ
+# ============================================================
+
+def get_status_line(item):
+    account = item["account"]
+    status = item.get("status")
+
+    if status == "free":
+        return (
+            f'<a href="{item["source_link"]}">'
+            f"ACCOUNT {account}"
+            f"</a> — 🟢 СВОБОДЕН"
+        )
+
+    if status == "occupied":
+        remaining = format_remaining(
+            item.get("expires_at")
+        )
+
+        if remaining:
+            return (
+                f'<a href="{item["source_link"]}">'
+                f"ACCOUNT {account}"
+                f"</a> — 🔴 ЗАНЯТ — осталось {remaining}"
+            )
+
+        return (
+            f'<a href="{item["source_link"]}">'
+            f"ACCOUNT {account}"
+            f"</a> — 🔴 ЗАНЯТ"
+        )
+
+    if status == "metro_ban":
+        remaining = format_remaining(
+            item.get("expires_at")
+        )
+
+        if remaining:
+            return (
+                f'<a href="{item["source_link"]}">'
+                f"ACCOUNT {account}"
+                f"</a> — 🔴 БАН МЕТРО — осталось {remaining}"
+            )
+
+        return (
+            f'<a href="{item["source_link"]}">'
+            f"ACCOUNT {account}"
+            f"</a> — 🔴 БАН МЕТРО"
+        )
+
+    if status == "unavailable":
+        remaining = format_remaining(
+            item.get("expires_at")
+        )
+
+        if remaining:
+            return (
+                f'<a href="{item["source_link"]}">'
+                f"ACCOUNT {account}"
+                f"</a> — 🔴 НЕ ДОСТУПЕН — осталось {remaining}"
+            )
+
+        return (
+            f'<a href="{item["source_link"]}">'
+            f"ACCOUNT {account}"
+            f"</a> — 🔴 НЕ ДОСТУПЕН"
+        )
+
+    return None
+
+
+# ============================================================
+# СОЗДАНИЕ ИТОГОВОГО ТЕКСТА
+# ============================================================
+
+def render_summary():
+    lines = [
+        "🟢 <b>СТАТУС АРЕНДЫ</b> 🟢",
+        "",
+    ]
+
+    # Строго ACCOUNT 1 -> ACCOUNT 50
+    for account in range(
+        MIN_ACCOUNT,
+        MAX_ACCOUNT + 1,
+    ):
+
+        item = statuses.get(str(account))
+
+        if not item:
+            # Если аккаунт пока не найден,
+            # не выводим пустую строку.
+            continue
+
+        if item.get("status") == "inactive":
+            continue
+
+        line = get_status_line(item)
+
+        if line:
+            lines.append(line)
 
     return "\n".join(lines)
 
 
-async def safe_answer(message: Message, text: str):
-    try:
-        await message.answer(text)
-    except TelegramRetryAfter as e:
-        await asyncio.sleep(e.retry_after + 1)
-        try:
-            await message.answer(text)
-        except Exception:
-            pass
-    except Exception:
-        pass
+# ============================================================
+# ПОИСК/СОЗДАНИЕ ИТОГОВОГО СООБЩЕНИЯ
+# ============================================================
 
+async def get_or_create_summary_message():
+    global summary_message_id
 
-async def safe_send_reply(chat_id: int, reply_to_message_id: int, text: str):
-    try:
-        await bot.send_message(chat_id=chat_id, text=text, reply_to_message_id=reply_to_message_id)
-    except TelegramRetryAfter as e:
-        await asyncio.sleep(e.retry_after + 1)
-        try:
-            await bot.send_message(chat_id=chat_id, text=text, reply_to_message_id=reply_to_message_id)
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-
-async def edit_status(chat_id: int, status_id: str, force=False):
-    g = get_group(chat_id)
-    s = g["statuses"].get(status_id)
-    if not s:
-        return
-
-    caption = make_caption(chat_id, status_id)
-    if not force and s.get("last_caption") == caption:
-        return
-
-    try:
-        await bot.edit_message_caption(chat_id=chat_id, message_id=s["message_id"], caption=caption)
-        s["last_caption"] = caption
-        save_data()
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e).lower():
-            print(f"Ошибка обновления {status_id}: {e}")
-    except TelegramRetryAfter as e:
-        await asyncio.sleep(e.retry_after + 1)
-        await edit_status(chat_id, status_id, True)
-    except Exception as e:
-        print(f"Ошибка обновления {status_id}: {e}")
-
-
-def find_status_by_message_id(chat_id: int, message_id: int):
-    g = get_group(chat_id)
-    for sid, s in g["statuses"].items():
-        if s.get("message_id") == message_id:
-            return sid
-    return None
-
-
-def sync_last_created(g):
-    mx = 0
-    for k in g["statuses"].keys():
-        if str(k).isdigit():
-            mx = max(mx, int(k))
-    g["last_created"] = max(g.get("last_created", 0), mx)
-
-
-async def create_missing_statuses(message: Message):
-    chat_id = message.chat.id
-
-    async with data_lock:
-        g = get_group(chat_id)
-        sync_last_created(g)
-
-        if g["setup_running"]:
-            await safe_answer(message, "Создание уже идёт. Подожди.")
-            return
-
-        if g["last_created"] >= STATUSES_COUNT:
-            await safe_answer(message, "Уже есть все 55 статусов.")
-            return
-
-        g["setup_running"] = True
-        start_from = g["last_created"] + 1
-        save_data()
-
-    try:
-        for i in range(start_from, STATUSES_COUNT + 1):
-            sid = str(i)
-            caption = f"Статус {sid}\n\n🟢 Свободен"
-
-            sent = await bot.send_photo(chat_id=chat_id, photo=DEFAULT_PHOTO_URL, caption=caption)
-
-            async with data_lock:
-                g = get_group(chat_id)
-                g["statuses"][sid] = {
-                    "message_id": sent.message_id,
-                    "photo": DEFAULT_PHOTO_URL,
-                    "text": "",
-                    "busy_until": None,
-                    "reservation_until": None,
-                    "last_caption": caption
-                }
-                g["last_created"] = i
-                save_data()
-
-            await asyncio.sleep(1.2)
-
-        await safe_answer(message, "Готово. Статусы созданы до 55.")
-
-    except TelegramRetryAfter as e:
-        print(f"Flood limit. Retry after {e.retry_after}")
-        await asyncio.sleep(e.retry_after + 1)
-
-    except Exception as e:
-        print(f"Создание остановилось: {e}")
-
-    finally:
-        async with data_lock:
-            g = get_group(chat_id)
-            g["setup_running"] = False
-            save_data()
-
-
-@dp.message(Command("setup"))
-async def setup(message: Message):
-    g = get_group(message.chat.id)
-    sync_last_created(g)
-
-    if g["last_created"] > 0:
-        await safe_answer(message, "Статусы уже есть. Если не все — напиши /continue.")
-        save_data()
-        return
-
-    await create_missing_statuses(message)
-
-
-@dp.message(Command("continue"))
-async def continue_setup(message: Message):
-    await create_missing_statuses(message)
-
-
-@dp.message(Command("reset"))
-async def reset(message: Message):
-    async with data_lock:
-        g = get_group(message.chat.id)
-        g["statuses"] = {}
-        g["last_created"] = 0
-        g["setup_running"] = False
-        save_data()
-
-    await safe_answer(message, "База очищена. Старые сообщения не удалены. Теперь напиши /setup.")
-
-
-@dp.message(F.reply_to_message, ~F.text.startswith("/"))
-async def handle_reply(message: Message):
-    chat_id = message.chat.id
-    replied_id = message.reply_to_message.message_id
-    status_id = find_status_by_message_id(chat_id, replied_id)
-
-    if not status_id:
-        return
-
-    if message.content_type == ContentType.PHOTO:
-        file_id = message.photo[-1].file_id
-
-        async with data_lock:
-            g = get_group(chat_id)
-            s = g["statuses"][status_id]
-            s["photo"] = file_id
-            save_data()
+    # Если ID уже сохранён — пытаемся найти сообщение
+    if summary_message_id:
 
         try:
-            caption = make_caption(chat_id, status_id)
-            await bot.edit_message_media(
-                chat_id=chat_id,
-                message_id=s["message_id"],
-                media=InputMediaPhoto(media=file_id, caption=caption)
+            message = await client.get_messages(
+                TARGET_CHAT_ID,
+                ids=summary_message_id,
             )
 
-            async with data_lock:
-                s["last_caption"] = caption
+            if message:
+                return message
+
+        except Exception:
+            logger.exception(
+                "Не удалось получить сохранённое итоговое сообщение."
+            )
+
+    # Ищем сообщение среди последних сообщений группы
+    try:
+
+        async for message in client.iter_messages(
+            TARGET_CHAT_ID,
+            limit=100,
+        ):
+
+            if not message.raw_text:
+                continue
+
+            if "🟢 СТАТУС АРЕНДЫ 🟢" in message.raw_text:
+                summary_message_id = message.id
                 save_data()
 
-        except Exception as e:
-            await safe_answer(message, f"Не смог заменить фото: {e}")
+                logger.info(
+                    "Найдено существующее итоговое сообщение: %s",
+                    message.id,
+                )
 
-        return
+                return message
 
-    if message.content_type != ContentType.TEXT:
-        return
-
-    text = message.text.strip()
-    text_lower = text.lower()
-
-    gift = re.fullmatch(r"(\d+)\s*\+\s*(\d+)", text)
-    if gift:
-        base = int(gift.group(1))
-        bonus = int(gift.group(2))
-        total = base + bonus
-
-        async with data_lock:
-            g = get_group(chat_id)
-            s = g["statuses"][status_id]
-            s["busy_until"] = int(time.time()) + total * 3600
-            save_data()
-
-        try:
-            await message.delete()
-        except Exception:
-            pass
-
-        await safe_send_reply(
-            chat_id,
-            replied_id,
-            f"на {base} часов + {bonus} часа подарок\n{sender_name(message)}"
+    except Exception:
+        logger.exception(
+            "Ошибка поиска итогового сообщения."
         )
-        await edit_status(chat_id, status_id, True)
+
+    # Создаём новое
+    text = render_summary()
+
+    message = await client.send_message(
+        TARGET_CHAT_ID,
+        text,
+        parse_mode="html",
+        link_preview=False,
+    )
+
+    summary_message_id = message.id
+
+    save_data()
+
+    logger.info(
+        "Создано новое итоговое сообщение: %s",
+        message.id,
+    )
+
+    return message
+
+
+# ============================================================
+# ОБНОВЛЕНИЕ ИТОГОВОГО СООБЩЕНИЯ
+# ============================================================
+
+async def update_summary(force=False):
+    global last_rendered_text
+
+    normalize_expired_statuses()
+
+    text = render_summary()
+
+    if not force and text == last_rendered_text:
         return
 
-    if text_lower == "до утра":
-        sec = seconds_until_moscow_10()
+    try:
 
-        async with data_lock:
-            g = get_group(chat_id)
-            s = g["statuses"][status_id]
-            s["busy_until"] = int(time.time()) + sec
-            save_data()
+        message = await get_or_create_summary_message()
 
-        await edit_status(chat_id, status_id, True)
-        return
-
-    if text_lower.startswith("бронь"):
-        sec = parse_duration_to_seconds(text[5:].strip())
-        if not sec:
-            await safe_answer(message, "Не понял время брони. Пример: Бронь 1ч 30м")
+        if message.raw_text == text:
+            last_rendered_text = text
             return
 
-        async with data_lock:
-            g = get_group(chat_id)
-            s = g["statuses"][status_id]
-            s["reservation_until"] = int(time.time()) + sec
-            save_data()
+        await client.edit_message(
+            TARGET_CHAT_ID,
+            message.id,
+            text,
+            parse_mode="html",
+            link_preview=False,
+        )
 
-        await edit_status(chat_id, status_id, True)
-        return
+        last_rendered_text = text
 
-    time_match = re.fullmatch(r"(\d+):(\d{1,2})", text)
-    if time_match:
-        hours = int(time_match.group(1))
-        minutes = int(time_match.group(2))
+        logger.info(
+            "Итоговое сообщение обновлено."
+        )
 
-        if minutes >= 60:
-            await safe_answer(message, "Минут должно быть меньше 60.")
-            return
+    except FloodWaitError as e:
 
-        if hours > 999:
-            await safe_answer(message, "Слишком большое число часов. Максимум 999.")
-            return
+        logger.warning(
+            "Telegram FloodWait: ждём %s секунд",
+            e.seconds,
+        )
 
-        async with data_lock:
-            g = get_group(chat_id)
-            s = g["statuses"][status_id]
-            s["busy_until"] = int(time.time()) + hours * 3600 + minutes * 60
-            save_data()
+        await asyncio.sleep(e.seconds)
 
-        await edit_status(chat_id, status_id, True)
-        return
+    except Exception:
+        logger.exception(
+            "Ошибка обновления итогового сообщения."
+        )
 
-    if text.isdigit():
-        hours = int(text)
 
-        async with data_lock:
-            g = get_group(chat_id)
-            s = g["statuses"][status_id]
+# ============================================================
+# ПЕРВОНАЧАЛЬНАЯ СИНХРОНИЗАЦИЯ
+# ============================================================
 
-            if hours == 0:
-                s["busy_until"] = None
-            elif hours > 999:
-                await safe_answer(message, "Слишком большое число часов. Максимум 999.")
-                return
-            else:
-                s["busy_until"] = int(time.time()) + hours * 3600
+async def initial_sync():
+    logger.info(
+        "Начинаем первоначальную синхронизацию первой группы..."
+    )
 
-            save_data()
+    found = set()
 
-        await edit_status(chat_id, status_id, True)
-        return
+    try:
 
-    plus_text_timer = re.fullmatch(r"(\d+)\s+\+(.+)", text)
-    if plus_text_timer:
-        hours = int(plus_text_timer.group(1))
-        extra = plus_text_timer.group(2)
+        async for message in client.iter_messages(
+            SOURCE_CHAT_ID,
+            limit=None,
+        ):
 
-        if hours > 999:
-            await safe_answer(message, "Слишком большое число часов. Максимум 999.")
-            return
+            if not message.raw_text:
+                continue
 
-        async with data_lock:
-            g = get_group(chat_id)
-            s = g["statuses"][status_id]
-            s["busy_until"] = int(time.time()) + hours * 3600
-            s["text"] = extra
-            save_data()
+            account = extract_account_number(
+                message.raw_text
+            )
 
-        await edit_status(chat_id, status_id, True)
-        return
+            if account is None:
+                continue
 
-    any_text_timer = re.fullmatch(r"(\d+)\s+(.+)", text)
-    if any_text_timer:
-        hours = int(any_text_timer.group(1))
+            # Нас интересуют только 1-50
+            if not (
+                MIN_ACCOUNT
+                <= account
+                <= MAX_ACCOUNT
+            ):
+                continue
 
-        if hours > 999:
-            await safe_answer(message, "Слишком большое число часов. Максимум 999.")
-            return
+            # В истории сообщения одного аккаунта могут
+            # встречаться много раз.
+            #
+            # iter_messages идёт от новых к старым,
+            # поэтому первое найденное сообщение —
+            # самое свежее.
+            if account in found:
+                continue
 
-        async with data_lock:
-            g = get_group(chat_id)
-            s = g["statuses"][status_id]
-            s["busy_until"] = int(time.time()) + hours * 3600
-            save_data()
+            if process_message(message):
+                found.add(account)
 
-        await edit_status(chat_id, status_id, True)
-        return
+                logger.info(
+                    "Синхронизирован ACCOUNT %s",
+                    account,
+                )
 
-    if text.startswith("+"):
-        async with data_lock:
-            g = get_group(chat_id)
-            s = g["statuses"][status_id]
-            s["text"] = text[1:]
-            save_data()
+            if len(found) >= MAX_ACCOUNT:
+                # Все 50 нашли.
+                break
 
-        await edit_status(chat_id, status_id, True)
-        return
+    except Exception:
+        logger.exception(
+            "Ошибка первоначальной синхронизации."
+        )
 
+    logger.info(
+        "Первоначальная синхронизация завершена. Найдено: %s/50",
+        len(found),
+    )
+
+
+# ============================================================
+# НОВЫЕ СООБЩЕНИЯ
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        chats=SOURCE_CHAT_ID
+    )
+)
+async def new_source_message(event):
+
+    try:
+
+        message = event.message
+
+        if process_message(message):
+            await update_summary(
+                force=True
+            )
+
+    except Exception:
+        logger.exception(
+            "Ошибка обработки нового сообщения."
+        )
+
+
+# ============================================================
+# ИЗМЕНЕНИЯ СООБЩЕНИЙ
+# ============================================================
+
+@client.on(
+    events.MessageEdited(
+        chats=SOURCE_CHAT_ID
+    )
+)
+async def edited_source_message(event):
+
+    try:
+
+        message = event.message
+
+        if process_message(message):
+            await update_summary(
+                force=True
+            )
+
+    except Exception:
+        logger.exception(
+            "Ошибка обработки изменённого сообщения."
+        )
+
+
+# ============================================================
+# МИНУТНЫЙ ТАЙМЕР
+# ============================================================
 
 async def timer_loop():
+
+    global last_rendered_text
+
     while True:
-        to_edit = []
-        warnings = []
 
-        async with data_lock:
-            now = int(time.time())
+        try:
 
-            for chat_id_str, g in data["groups"].items():
-                chat_id = int(chat_id_str)
+            # Пересчитываем окончания
+            normalize_expired_statuses()
 
-                for sid, s in g["statuses"].items():
-                    changed = False
+            # Создаём новый текст с актуальными минутами
+            text = render_summary()
 
-                    busy = s.get("busy_until")
-                    bron = s.get("reservation_until")
+            if text != last_rendered_text:
+                await update_summary()
 
-                    if busy and busy <= now:
-                        s["busy_until"] = None
-                        changed = True
+        except Exception:
+            logger.exception(
+                "Ошибка в timer_loop."
+            )
 
-                    if bron and bron <= now:
-                        s["reservation_until"] = None
-                        changed = True
-                        warnings.append((chat_id, sid))
+        await asyncio.sleep(
+            UPDATE_INTERVAL
+        )
 
-                    new_caption = make_caption(chat_id, sid)
-                    old_caption = s.get("last_caption", "")
 
-                    if changed or new_caption != old_caption:
-                        to_edit.append((chat_id, sid))
-
-            save_data()
-
-        for chat_id, sid in to_edit:
-            await edit_status(chat_id, sid, True)
-            await asyncio.sleep(0.25)
-
-        for chat_id, sid in warnings:
-            try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"⚠️ Пора выдать попке аккаунт.\nЛот: Статус {sid}"
-                )
-                await asyncio.sleep(0.5)
-            except TelegramRetryAfter as e:
-                await asyncio.sleep(e.retry_after + 1)
-            except Exception as e:
-                print(f"Не смог отправить предупреждение: {e}")
-
-        await asyncio.sleep(60)
-
+# ============================================================
+# ЗАПУСК
+# ============================================================
 
 async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("Нет BOT_TOKEN")
 
-    asyncio.create_task(timer_loop())
-    await dp.start_polling(bot)
+    logger.info(
+        "=================================================="
+    )
+
+    logger.info(
+        "STATUS AGGREGATOR STARTING"
+    )
+
+    logger.info(
+        "SOURCE_CHAT_ID = %s",
+        SOURCE_CHAT_ID,
+    )
+
+    logger.info(
+        "TARGET_CHAT_ID = %s",
+        TARGET_CHAT_ID,
+    )
+
+    logger.info(
+        "ACCOUNTS = %s-%s",
+        MIN_ACCOUNT,
+        MAX_ACCOUNT,
+    )
+
+    logger.info(
+        "=================================================="
+    )
+
+    load_data()
+
+    # Подключение через BOT TOKEN
+    await client.start(
+        bot_token=BOT_TOKEN
+    )
+
+    me = await client.get_me()
+
+    logger.info(
+        "Бот авторизован: @%s | id=%s",
+        me.username,
+        me.id,
+    )
+
+    # Первоначально читаем существующую историю
+    await initial_sync()
+
+    # Создаём/находим одно сообщение во второй группе
+    await get_or_create_summary_message()
+
+    # Первое обновление
+    await update_summary(
+        force=True
+    )
+
+    # Запускаем минутный цикл
+    asyncio.create_task(
+        timer_loop()
+    )
+
+    logger.info(
+        "Бот запущен и ожидает изменения статусов..."
+    )
+
+    # Ждём события Telegram
+    await client.run_until_disconnected()
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# =========
