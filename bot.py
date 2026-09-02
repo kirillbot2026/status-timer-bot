@@ -1,604 +1,323 @@
 import os
 import re
 import asyncio
-import logging
 from datetime import datetime
 
-from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError
+from telegram import Bot, Update
+from telegram.ext import (
+    Application,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-
-# ============================================================
-# НАСТРОЙКИ
-# ============================================================
-
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-
 SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])
 TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])
 
-# Сколько аккаунтов показываем во второй группе
-MAX_ACCOUNTS = 50
-
-# Как часто обновлять итоговое сообщение
+ACCOUNTS_COUNT = 50
 UPDATE_INTERVAL = 60
 
+statuses = {
+    i: "🟢 СВОБОДЕН"
+    for i in range(1, ACCOUNTS_COUNT + 1)
+}
 
-# ============================================================
-# ЛОГИ
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-
-log = logging.getLogger("status-bot")
-
-
-# ============================================================
-# TELEGRAM CLIENT
-# ============================================================
-
-client = TelegramClient(
-    "status_timer_bot",
-    API_ID,
-    API_HASH
-)
-
-
-# ============================================================
-# ДАННЫЕ
-# ============================================================
-
-# account_number -> информация
-statuses = {}
-
-# ID сообщения во второй группе
 target_message_id = None
 
 
-# ============================================================
-# РАЗБОР СТАТУСА
-# ============================================================
-
-def parse_status(text: str):
-    """
-    Пример входного сообщения:
-
-    Аккаунт 10
-
-    🟢 Свободен
-    email
-    password
-
-    или:
-
-    Аккаунт 12
-
-    🟢 Свободен
-    🟡 Бан метро
-    Осталось: 22ч
-
-    или:
-
-    Аккаунт 37
-
-    🔴 Занят
-    Осталось: 2ч 52м
-
-    или:
-
-    Аккаунт 27
-
-    🟢 Свободен
-    ⚫ Бан
-    Осталось: 1д 11ч
-    """
-
-    if not text:
-        return None
-
-    # Ищем номер аккаунта
-    match = re.search(
-        r"(?:аккаунт|account)\s*#?\s*(\d+)",
-        text,
-        re.IGNORECASE
-    )
-
+def parse_account(text: str):
+    match = re.search(r"Аккаунт\s+(\d+)", text, re.IGNORECASE)
     if not match:
         return None
 
-    account = int(match.group(1))
+    number = int(match.group(1))
 
-    # Сейчас показываем 1-50
-    if account < 1 or account > MAX_ACCOUNTS:
-        return None
-
-    # --------------------------------------------------------
-    # СВОБОДЕН
-    # --------------------------------------------------------
-
-    if re.search(r"🟢\s*(?:свободен|свободно)", text, re.IGNORECASE):
-
-        # Бан метро
-        metro = re.search(
-            r"🟡\s*(?:бан\s+метро|метро).*?(?:осталось:\s*)?([^\n]+)",
-            text,
-            re.IGNORECASE
-        )
-
-        if metro:
-            remaining = metro.group(1).strip()
-
-            return {
-                "account": account,
-                "type": "metro",
-                "remaining": remaining,
-                "priority": 2
-            }
-
-        # Обычный бан / недоступен
-        unavailable = re.search(
-            r"(?:⚫|🔴)\s*(?:бан|не\s*доступен).*?(?:осталось:\s*)?([^\n]+)",
-            text,
-            re.IGNORECASE
-        )
-
-        if unavailable:
-            remaining = unavailable.group(1).strip()
-
-            return {
-                "account": account,
-                "type": "unavailable",
-                "remaining": remaining,
-                "priority": 3
-            }
-
-        return {
-            "account": account,
-            "type": "free",
-            "remaining": "",
-            "priority": 1
-        }
-
-    # --------------------------------------------------------
-    # ЗАНЯТ
-    # --------------------------------------------------------
-
-    if re.search(r"🔴\s*занят", text, re.IGNORECASE):
-
-        remaining_match = re.search(
-            r"осталось:\s*([^\n]+)",
-            text,
-            re.IGNORECASE
-        )
-
-        remaining = ""
-
-        if remaining_match:
-            remaining = remaining_match.group(1).strip()
-
-        return {
-            "account": account,
-            "type": "busy",
-            "remaining": remaining,
-            "priority": 4
-        }
-
-    # --------------------------------------------------------
-    # НЕАКТИВЕН / ДРУГИЕ СТАТУСЫ
-    # --------------------------------------------------------
-    # Нам специально не нужен "Неактивен".
-    # Если исходный бот выставил неизвестный статус,
-    # просто игнорируем его.
+    if 1 <= number <= ACCOUNTS_COUNT:
+        return number
 
     return None
 
 
-# ============================================================
-# ФОРМАТИРОВАНИЕ
-# ============================================================
+def parse_status(text: str):
+    text_lower = text.lower()
 
-def format_status(item):
-    account = item["account"]
-    status_type = item["type"]
-    remaining = item["remaining"]
-
-    # Пока ссылка на аккаунт не задана.
-    # Позже сделаем отдельную систему ссылок.
-    account_text = f"ACCOUNT {account}"
-
-    if status_type == "free":
-        return f"{account_text} — 🟢 СВОБОДЕН"
-
-    if status_type == "metro":
-        return (
-            f"{account_text} — 🔴 НЕ ДОСТУПЕН — "
-            f"БАН МЕТРО {remaining}"
+    # Бан метро
+    if "бан метро" in text_lower:
+        match = re.search(
+            r"Осталось:\s*([^\n]+)",
+            text,
+            re.IGNORECASE
         )
 
-    if status_type == "unavailable":
+        remaining = match.group(1).strip() if match else ""
+
         if remaining:
-            return (
-                f"{account_text} — 🔴 НЕ ДОСТУПЕН "
-                f"{remaining}"
-            )
+            return f"🔴 НЕ ДОСТУПЕН — БАН МЕТРО {remaining}"
 
-        return f"{account_text} — 🔴 НЕ ДОСТУПЕН"
+        return "🔴 НЕ ДОСТУПЕН — БАН МЕТРО"
 
-    if status_type == "busy":
+    # Обычный бан
+    if re.search(r"[⚫🔴]\s*Бан\b", text, re.IGNORECASE):
+        match = re.search(
+            r"Осталось:\s*([^\n]+)",
+            text,
+            re.IGNORECASE
+        )
+
+        remaining = match.group(1).strip() if match else ""
+
         if remaining:
-            return (
-                f"{account_text} — 🔴 ЗАНЯТ "
-                f"{remaining}"
-            )
+            return f"🔴 НЕ ДОСТУПЕН {remaining}"
 
-        return f"{account_text} — 🔴 ЗАНЯТ"
+        return "🔴 НЕ ДОСТУПЕН"
+
+    # Занят
+    if re.search(r"🔴\s*Занят", text, re.IGNORECASE):
+        match = re.search(
+            r"Осталось:\s*([^\n]+)",
+            text,
+            re.IGNORECASE
+        )
+
+        remaining = match.group(1).strip() if match else ""
+
+        if remaining:
+            return f"🔴 ЗАНЯТ {remaining}"
+
+        return "🔴 ЗАНЯТ"
+
+    # Свободен
+    if re.search(r"🟢\s*Свободен", text, re.IGNORECASE):
+        return "🟢 СВОБОДЕН"
 
     return None
 
 
-# ============================================================
-# СОБИРАЕМ ИТОГОВОЕ СООБЩЕНИЕ
-# ============================================================
-
-def build_message():
-
+def build_text():
     lines = [
         "🟢 СТАТУС АРЕНДЫ 🟢",
         ""
     ]
 
-    for account in sorted(statuses.keys()):
-
-        item = statuses[account]
-
-        line = format_status(item)
-
-        if line:
-            lines.append(line)
+    for account in range(1, ACCOUNTS_COUNT + 1):
+        lines.append(
+            f"ACCOUNT {account} — {statuses[account]}"
+        )
 
     return "\n".join(lines)
 
 
-# ============================================================
-# ПОИСК СТАРЫХ СТАТУСОВ
-# ============================================================
-
-async def load_old_messages():
-
-    log.info("========================================")
-    log.info("НАЧАЛО ЗАГРУЗКИ СТАРЫХ СООБЩЕНИЙ")
-    log.info("SOURCE_CHAT_ID = %s", SOURCE_CHAT_ID)
-    log.info("========================================")
-
-    count = 0
-    found = 0
-
-    try:
-
-        async for message in client.iter_messages(
-            SOURCE_CHAT_ID,
-            limit=3000
-        ):
-
-            count += 1
-
-            if not message.text:
-                continue
-
-            parsed = parse_status(message.text)
-
-            if parsed:
-
-                account = parsed["account"]
-
-                # Последнее найденное сообщение для аккаунта
-                # считаем актуальным.
-                if account not in statuses:
-                    statuses[account] = parsed
-                    found += 1
-
-                    log.info(
-                        "НАЙДЕН АККАУНТ %s | %s",
-                        account,
-                        format_status(parsed)
-                    )
-
-        log.info(
-            "ПРОСМОТРЕНО СООБЩЕНИЙ: %s",
-            count
-        )
-
-        log.info(
-            "НАЙДЕНО АККАУНТОВ: %s",
-            found
-        )
-
-    except Exception:
-
-        log.exception(
-            "ОШИБКА ПРИ ЧТЕНИИ ИСТОРИИ SOURCE_CHAT"
-        )
-
-        raise
-
-
-# ============================================================
-# СОЗДАНИЕ / ОБНОВЛЕНИЕ ИТОГОВОГО СООБЩЕНИЯ
-# ============================================================
-
-async def update_target_message():
-
+async def find_target_message(bot: Bot):
     global target_message_id
 
-    text = build_message()
+    try:
+        # Проверяем последние сообщения в целевой группе
+        # через getUpdates здесь историю получить нельзя,
+        # поэтому при первом запуске просто создаём сообщение.
+        return None
 
-    log.info(
-        "Обновление итогового сообщения. Аккаунтов: %s",
-        len(statuses)
-    )
+    except Exception as e:
+        print(f"[TARGET SEARCH ERROR] {e}", flush=True)
+        return None
+
+
+async def update_target(bot: Bot):
+    global target_message_id
+
+    text = build_text()
 
     try:
-
-        # Если сообщение ещё неизвестно —
-        # ищем последнее сообщение нашего бота
         if target_message_id is None:
-
-            me = await client.get_me()
-
-            log.info(
-                "Бот: @%s",
-                me.username
+            message = await bot.send_message(
+                chat_id=TARGET_CHAT_ID,
+                text=text
             )
 
-            async for message in client.iter_messages(
-                TARGET_CHAT_ID,
-                limit=30
-            ):
+            target_message_id = message.message_id
 
-                if (
-                    message.sender_id == me.id
-                    and message.text
-                    and "🟢 СТАТУС АРЕНДЫ 🟢" in message.text
-                ):
-
-                    target_message_id = message.id
-
-                    log.info(
-                        "НАЙДЕНО СТАРОЕ ИТОГОВОЕ СООБЩЕНИЕ: %s",
-                        target_message_id
-                    )
-
-                    break
-
-        # Если сообщения ещё нет — создаём
-        if target_message_id is None:
-
-            message = await client.send_message(
-                TARGET_CHAT_ID,
-                text
-            )
-
-            target_message_id = message.id
-
-            log.info(
-                "СОЗДАНО ИТОГОВОЕ СООБЩЕНИЕ: %s",
-                target_message_id
+            print(
+                f"[TARGET] Создано сообщение ID={target_message_id}",
+                flush=True
             )
 
         else:
+            try:
+                await bot.edit_message_text(
+                    chat_id=TARGET_CHAT_ID,
+                    message_id=target_message_id,
+                    text=text
+                )
 
-            await client.edit_message(
-                TARGET_CHAT_ID,
-                target_message_id,
-                text
-            )
+            except Exception as e:
+                error_text = str(e).lower()
 
-            log.info(
-                "ИТОГОВОЕ СООБЩЕНИЕ ОБНОВЛЕНО: %s",
-                target_message_id
-            )
+                if "message is not modified" not in error_text:
+                    print(
+                        f"[TARGET EDIT ERROR] {e}",
+                        flush=True
+                    )
 
-    except FloodWaitError as e:
-
-        log.warning(
-            "FloodWait: ждём %s секунд",
-            e.seconds
-        )
-
-        await asyncio.sleep(e.seconds)
-
-    except Exception:
-
-        log.exception(
-            "ОШИБКА ОБНОВЛЕНИЯ TARGET"
-        )
+    except Exception as e:
+        print(f"[TARGET ERROR] {e}", flush=True)
 
 
-# ============================================================
-# НОВОЕ / ИЗМЕНЁННОЕ СООБЩЕНИЕ
-# ============================================================
-
-async def process_message(message):
-
-    if not message:
-        return
-
+async def process_source_message(message):
     if not message.text:
         return
 
-    parsed = parse_status(message.text)
+    text = message.text
 
-    if not parsed:
+    account = parse_account(text)
+
+    if account is None:
         return
 
-    account = parsed["account"]
+    status = parse_status(text)
 
-    statuses[account] = parsed
+    if status is None:
+        return
 
-    log.info(
-        "ИЗМЕНЕНИЕ | ACCOUNT %s | %s",
-        account,
-        format_status(parsed)
+    statuses[account] = status
+
+    print(
+        f"[SOURCE] ACCOUNT {account} -> {status}",
+        flush=True
     )
 
-    await update_target_message()
+
+async def source_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    message = update.effective_message
+
+    if message is None:
+        return
+
+    if message.chat_id != SOURCE_CHAT_ID:
+        return
+
+    await process_source_message(message)
+
+    await update_target(context.bot)
 
 
-# ============================================================
-# НОВЫЕ СООБЩЕНИЯ
-# ============================================================
+async def minute_update(context: ContextTypes.DEFAULT_TYPE):
+    await update_target(context.bot)
 
-@client.on(events.NewMessage(chats=SOURCE_CHAT_ID))
-async def new_message_handler(event):
 
-    log.info(
-        "Получено НОВОЕ сообщение SOURCE | id=%s",
-        event.message.id
+async def post_init(application: Application):
+    print("=================================", flush=True)
+    print("STATUS TIMER BOT", flush=True)
+    print("=================================", flush=True)
+
+    print("[1] BOT_TOKEN загружен", flush=True)
+    print(
+        f"[2] SOURCE_CHAT_ID = {SOURCE_CHAT_ID}",
+        flush=True
+    )
+    print(
+        f"[3] TARGET_CHAT_ID = {TARGET_CHAT_ID}",
+        flush=True
     )
 
-    await process_message(event.message)
-
-
-# ============================================================
-# ИЗМЕНЕНИЯ СООБЩЕНИЙ
-# ============================================================
-
-@client.on(events.MessageEdited(chats=SOURCE_CHAT_ID))
-async def edited_message_handler(event):
-
-    log.info(
-        "Получено ИЗМЕНЕНИЕ SOURCE | id=%s",
-        event.message.id
+    print(
+        f"[4] Создано аккаунтов: {ACCOUNTS_COUNT}",
+        flush=True
     )
 
-    await process_message(event.message)
-
-
-# ============================================================
-# ПЕРИОДИЧЕСКОЕ ОБНОВЛЕНИЕ
-# ============================================================
-
-async def periodic_update():
-
-    while True:
-
-        try:
-
-            await asyncio.sleep(UPDATE_INTERVAL)
-
-            log.info(
-                "МИНУТНЫЙ ЦИКЛ | аккаунтов: %s",
-                len(statuses)
-            )
-
-            await update_target_message()
-
-        except asyncio.CancelledError:
-
-            raise
-
-        except Exception:
-
-            log.exception(
-                "Ошибка минутного цикла"
-            )
-
-
-# ============================================================
-# ЗАПУСК
-# ============================================================
-
-async def main():
-
-    log.info("========================================")
-    log.info("STATUS TIMER BOT")
-    log.info("========================================")
-
-    log.info("[1] API_ID загружен")
-    log.info("[2] API_HASH загружен")
-    log.info("[3] BOT_TOKEN загружен")
-    log.info("[4] SOURCE_CHAT_ID = %s", SOURCE_CHAT_ID)
-    log.info("[5] TARGET_CHAT_ID = %s", TARGET_CHAT_ID)
-
-    log.info("[6] Подключение к Telegram...")
-
-    await client.start(
-        bot_token=BOT_TOKEN
+    print(
+        "[5] Все аккаунты установлены как СВОБОДЕН",
+        flush=True
     )
 
-    log.info("[7] Telegram подключен")
+    try:
+        me = await application.bot.get_me()
 
-    me = await client.get_me()
+        print(
+            f"[6] Авторизован как @{me.username} | id={me.id}",
+            flush=True
+        )
 
-    log.info(
-        "[8] Авторизован как @%s | id=%s | bot=%s",
-        me.username,
-        me.id,
-        me.bot
+    except Exception as e:
+        print(
+            f"[BOT ERROR] Не удалось подключиться: {e}",
+            flush=True
+        )
+        raise
+
+    print("[7] Проверяем SOURCE...", flush=True)
+
+    try:
+        chat = await application.bot.get_chat(SOURCE_CHAT_ID)
+
+        print(
+            f"[SOURCE] Найден чат: {chat.title}",
+            flush=True
+        )
+
+    except Exception as e:
+        print(
+            f"[SOURCE ERROR] {e}",
+            flush=True
+        )
+
+    print("[8] Проверяем TARGET...", flush=True)
+
+    try:
+        chat = await application.bot.get_chat(TARGET_CHAT_ID)
+
+        print(
+            f"[TARGET] Найден чат: {chat.title}",
+            flush=True
+        )
+
+    except Exception as e:
+        print(
+            f"[TARGET ERROR] {e}",
+            flush=True
+        )
+
+    print("[9] Создаём итоговое сообщение...", flush=True)
+
+    await update_target(application.bot)
+
+    print(
+        f"[READY] БОТ ЗАПУЩЕН | АККАУНТОВ: {ACCOUNTS_COUNT}",
+        flush=True
     )
 
-    # Проверяем доступ к SOURCE
-    log.info("[9] Проверяем SOURCE...")
 
-    source = await client.get_entity(SOURCE_CHAT_ID)
-
-    log.info(
-        "[10] SOURCE найден: %s",
-        getattr(source, "title", "unknown")
+def main():
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
     )
 
-    # Проверяем TARGET
-    log.info("[11] Проверяем TARGET...")
-
-    target = await client.get_entity(TARGET_CHAT_ID)
-
-    log.info(
-        "[12] TARGET найден: %s",
-        getattr(target, "title", "unknown")
+    # Новые сообщения из исходной группы
+    application.add_handler(
+        MessageHandler(
+            filters.ALL,
+            source_handler
+        )
     )
 
-    # Загружаем существующие статусы
-    log.info("[13] Загружаем существующие статусы...")
-
-    await load_old_messages()
-
-    # Создаём первое итоговое сообщение
-    log.info("[14] Создаём итоговое сообщение...")
-
-    await update_target_message()
-
-    log.info("========================================")
-    log.info(
-        "[READY] БОТ ЗАПУЩЕН | АККАУНТОВ: %s",
-        len(statuses)
-    )
-    log.info("========================================")
-
-    # Запускаем минутное обновление
-    asyncio.create_task(
-        periodic_update()
+    # Обновление раз в минуту
+    application.job_queue.run_repeating(
+        minute_update,
+        interval=UPDATE_INTERVAL,
+        first=UPDATE_INTERVAL
     )
 
-    # Оставляем Telegram connection открытым
-    await client.run_until_disconnected()
+    print("[START] Запуск Telegram Bot...", flush=True)
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
-
-    try:
-        asyncio.run(main())
-
-    except KeyboardInterrupt:
-
-        log.info("Остановка бота")
-
-    except Exception:
-
-        log.exception(
-            "КРИТИЧЕСКАЯ ОШИБКА"
-                    )
+    main()
