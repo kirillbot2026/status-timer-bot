@@ -7,8 +7,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageFont
-from telegram import Bot, InputMediaPhoto, Update
+from PIL import Image
+from telegram import Bot, Update
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
@@ -24,21 +24,21 @@ SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])
 CONTROL_CHAT_ID = int(os.environ["CONTROL_CHAT_ID"])
 
 INITIAL_TARGET = os.getenv("TARGET_CHAT_ID")
+
 INITIAL_COUNT = max(
     1,
-    min(300, int(os.getenv("ACCOUNTS_COUNT", "50")))
+    int(os.getenv("ACCOUNTS_COUNT", "50"))
 )
 
 STATE_FILE = Path(
     os.getenv("STATE_FILE", "bot_state.json")
 )
 
-UPDATE_INTERVAL = 60
-MAX_ACCOUNTS = 300
-ROWS_PER_COLUMN = 50
+FIRST_PAGE_COUNT = 30
+MAX_ACCOUNTS = 150
 
 FREE_STATUS = "🟢 СВОБОДЕН"
-DEFAULT_CAPTION = "Статус аренды"
+DEFAULT_CUSTOM_TEXT = "🟢 СТАТУС АРЕНДЫ 🟢"
 
 
 logging.basicConfig(
@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 state_lock = asyncio.Lock()
 
 
-def initial_target() -> int | str | None:
+def env_target() -> int | str | None:
     if not INITIAL_TARGET:
         return None
 
@@ -71,9 +71,10 @@ state: dict[str, Any] = {
         )
     },
 
-    "target_chat_id": initial_target(),
-    "target_message_id": None,
-    "caption": DEFAULT_CAPTION,
+    "target_chat_id": env_target(),
+    "photo_message_id": None,
+    "text_message_id": None,
+    "custom_text": DEFAULT_CUSTOM_TEXT,
 }
 
 
@@ -126,17 +127,25 @@ def load_state() -> None:
 
             "target_chat_id": saved.get(
                 "target_chat_id",
-                initial_target()
+                env_target()
             ),
 
-            "target_message_id": saved.get(
-                "target_message_id"
+            "photo_message_id": saved.get(
+                "photo_message_id",
+                saved.get("target_message_id")
             ),
 
-            "caption": str(
+            "text_message_id": saved.get(
+                "text_message_id"
+            ),
+
+            "custom_text": str(
                 saved.get(
-                    "caption",
-                    DEFAULT_CAPTION
+                    "custom_text",
+                    saved.get(
+                        "caption",
+                        DEFAULT_CUSTOM_TEXT
+                    )
                 )
             ),
         }
@@ -152,7 +161,7 @@ def load_state() -> None:
         json.JSONDecodeError
     ):
         logger.exception(
-            "Не удалось загрузить bot_state.json"
+            "Не удалось загрузить состояние"
         )
 
 
@@ -223,7 +232,8 @@ def parse_status(
     # Бан метро
     if "бан метро" in text.lower():
         status = (
-            "🔴 НЕ ДОСТУПЕН — БАН МЕТРО"
+            "🔴 НЕ ДОСТУПЕН — "
+            "БАН МЕТРО"
         )
 
         if remaining:
@@ -268,178 +278,91 @@ def parse_status(
     return None
 
 
-def find_font(
-    size: int,
-    bold: bool = False
-):
-    if bold:
-        names = [
-            (
-                "/usr/share/fonts/truetype/"
-                "dejavu/DejaVuSans-Bold.ttf"
-            ),
-            (
-                "/usr/share/fonts/truetype/"
-                "liberation2/"
-                "LiberationSans-Bold.ttf"
-            ),
-        ]
+def build_rows(
+    first: int,
+    last: int
+) -> str:
+    lines = []
 
-    else:
-        names = [
-            (
-                "/usr/share/fonts/truetype/"
-                "dejavu/DejaVuSans.ttf"
-            ),
-            (
-                "/usr/share/fonts/truetype/"
-                "liberation2/"
-                "LiberationSans-Regular.ttf"
-            ),
-        ]
-
-    for name in names:
-        if Path(name).exists():
-            return ImageFont.truetype(
-                name,
-                size
-            )
-
-    return ImageFont.load_default()
-
-
-def image_status(
-    status: str
-) -> tuple[
-    str,
-    tuple[int, int, int]
-]:
-    if status.startswith("🟢"):
-        clean_status = status.replace(
-            "🟢",
-            "●",
-            1
-        )
-
-        return (
-            clean_status,
-            (70, 230, 110)
-        )
-
-    if status.startswith(
-        ("🔴", "⚫")
+    for account in range(
+        first,
+        last + 1
     ):
-        clean_status = (
-            status
-            .replace("🔴", "●", 1)
-            .replace("⚫", "●", 1)
+        status = state["statuses"][
+            str(account)
+        ]
+
+        lines.append(
+            f"ACCOUNT {account} — {status}"
         )
 
-        return (
-            clean_status,
-            (255, 90, 90)
-        )
-
-    return (
-        status,
-        (240, 240, 240)
-    )
+    return "\n".join(lines)
 
 
-def render_status_image() -> io.BytesIO:
+def build_messages() -> tuple[
+    str,
+    str | None
+]:
     count = state["accounts_count"]
 
-    columns = max(
+    first_last = min(
+        FIRST_PAGE_COUNT,
+        count
+    )
+
+    first_rows = build_rows(
         1,
-        (
+        first_last
+    )
+
+    caption = (
+        f"{state['custom_text']}"
+        f"\n\n{first_rows}"
+    )
+
+    if count > FIRST_PAGE_COUNT:
+        second_message = build_rows(
+            FIRST_PAGE_COUNT + 1,
             count
-            + ROWS_PER_COLUMN
-            - 1
         )
-        // ROWS_PER_COLUMN
-    )
+    else:
+        second_message = None
 
-    rows = min(
-        count,
-        ROWS_PER_COLUMN
-    )
+    # Подпись к фотографии Telegram:
+    # максимум 1024 символа.
+    if len(caption) > 1024:
+        raise ValueError(
+            "Первое сообщение занимает "
+            f"{len(caption)} символов "
+            "при лимите 1024. "
+            "Сократи текст командой "
+            "/set_caption."
+        )
 
-    column_width = 720
-    margin = 55
-    header_height = 135
-    row_height = 43
+    # Обычное сообщение Telegram:
+    # максимум 4096 символов.
+    if (
+        second_message
+        and len(second_message) > 4096
+    ):
+        raise ValueError(
+            "Второе сообщение длиннее "
+            "лимита Telegram. "
+            "Уменьши количество аккаунтов."
+        )
 
-    width = (
-        margin * 2
-        + column_width * columns
-    )
+    return caption, second_message
 
-    height = (
-        header_height
-        + rows * row_height
-        + 55
-    )
+
+def create_black_photo() -> io.BytesIO:
+    output = io.BytesIO()
+    output.name = "black.png"
 
     image = Image.new(
         "RGB",
-        (width, height),
+        (1280, 720),
         "black"
     )
-
-    draw = ImageDraw.Draw(image)
-
-    title_font = find_font(
-        43,
-        bold=True
-    )
-
-    row_font = find_font(27)
-
-    draw.text(
-        (margin, 38),
-        "СТАТУС АРЕНДЫ",
-        font=title_font,
-        fill="white"
-    )
-
-    for account in range(
-        1,
-        count + 1
-    ):
-        column = (
-            account - 1
-        ) // ROWS_PER_COLUMN
-
-        row = (
-            account - 1
-        ) % ROWS_PER_COLUMN
-
-        status, color = image_status(
-            state["statuses"][str(account)]
-        )
-
-        x = (
-            margin
-            + column * column_width
-        )
-
-        y = (
-            header_height
-            + row * row_height
-        )
-
-        draw.text(
-            (x, y),
-            (
-                f"ACCOUNT {account} "
-                f"— {status}"
-            ),
-            font=row_font,
-            fill=color
-        )
-
-    output = io.BytesIO()
-    output.name = "status.png"
 
     image.save(
         output,
@@ -452,7 +375,27 @@ def render_status_image() -> io.BytesIO:
     return output
 
 
-def caption_from_command(
+def is_control_chat(
+    update: Update
+) -> bool:
+    message = update.effective_message
+
+    if message is None:
+        return False
+
+    if message.chat_id != CONTROL_CHAT_ID:
+        logger.warning(
+            "Команда отклонена "
+            "из чата %s",
+            message.chat_id
+        )
+
+        return False
+
+    return True
+
+
+def get_command_text(
     update: Update
 ) -> str:
     message = update.effective_message
@@ -460,8 +403,9 @@ def caption_from_command(
     if message is None:
         return ""
 
-    # Можно ответить командой
-    # на готовое сообщение с текстом.
+    # Можно написать готовый текст,
+    # а затем ответить на него
+    # командой /set_caption
     if message.reply_to_message:
         replied = message.reply_to_message
 
@@ -487,96 +431,170 @@ def caption_from_command(
     return ""
 
 
-def is_control(
-    update: Update
+async def create_board(
+    bot: Bot
 ) -> bool:
-    message = update.effective_message
+    target_chat_id = state[
+        "target_chat_id"
+    ]
 
-    if (
-        message
-        and message.chat_id
-        == CONTROL_CHAT_ID
-    ):
-        return True
+    if target_chat_id is None:
+        return False
 
-    if message:
-        logger.warning(
-            "Команда отклонена "
-            "из чата %s",
-            message.chat_id
+    caption, second_text = (
+        build_messages()
+    )
+
+    photo_message = await bot.send_photo(
+        chat_id=target_chat_id,
+        photo=create_black_photo(),
+        caption=caption
+    )
+
+    if second_text:
+        text_message = await bot.send_message(
+            chat_id=target_chat_id,
+            text=second_text
         )
 
-    return False
+        text_message_id = (
+            text_message.message_id
+        )
+
+    else:
+        text_message_id = None
+
+    state["target_chat_id"] = (
+        photo_message.chat_id
+    )
+
+    state["photo_message_id"] = (
+        photo_message.message_id
+    )
+
+    state["text_message_id"] = (
+        text_message_id
+    )
+
+    save_state()
+
+    return True
 
 
-async def publish_status(
-    bot: Bot,
-    force_new: bool = False
+async def update_board(
+    bot: Bot
 ) -> bool:
     async with state_lock:
-        target = state[
+        target_chat_id = state[
             "target_chat_id"
         ]
 
-        if target is None:
+        photo_message_id = state[
+            "photo_message_id"
+        ]
+
+        if target_chat_id is None:
             return False
 
-        picture = render_status_image()
+        # Если сообщения ещё не созданы,
+        # создаём новую пару.
+        if photo_message_id is None:
+            return await create_board(bot)
 
-        if force_new:
-            message_id = None
-        else:
-            message_id = state[
-                "target_message_id"
-            ]
+        caption, second_text = (
+            build_messages()
+        )
 
-        # Обновляем существующее сообщение
-        if message_id is not None:
-            try:
-                media = InputMediaPhoto(
-                    media=picture,
-                    caption=state["caption"]
-                )
+        # Обновляем подпись первого
+        # сообщения с фотографией.
+        try:
+            await bot.edit_message_caption(
+                chat_id=target_chat_id,
+                message_id=photo_message_id,
+                caption=caption
+            )
 
-                await bot.edit_message_media(
-                    chat_id=target,
-                    message_id=message_id,
-                    media=media
-                )
+        except BadRequest as error:
+            error_text = str(error).lower()
 
-                return True
-
-            except BadRequest as error:
-                if (
-                    "message is not modified"
-                    in str(error).lower()
-                ):
-                    return True
-
+            if (
+                "message is not modified"
+                not in error_text
+            ):
                 logger.warning(
-                    "Старое сообщение "
-                    "нельзя изменить: %s",
+                    "Первое сообщение "
+                    "недоступно. Создаём "
+                    "новую пару: %s",
                     error
                 )
 
-        # Создаём новое сообщение
-        picture.seek(0)
+                return await create_board(bot)
 
-        message = await bot.send_photo(
-            chat_id=target,
-            photo=picture,
-            caption=state["caption"]
-        )
+        text_message_id = state[
+            "text_message_id"
+        ]
 
-        state["target_chat_id"] = (
-            message.chat_id
-        )
+        # Обновляем второе сообщение.
+        if second_text:
+            if text_message_id:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=target_chat_id,
+                        message_id=text_message_id,
+                        text=second_text
+                    )
 
-        state["target_message_id"] = (
-            message.message_id
-        )
+                except BadRequest as error:
+                    error_text = (
+                        str(error).lower()
+                    )
 
-        save_state()
+                    if (
+                        "message is not modified"
+                        not in error_text
+                    ):
+                        sent = (
+                            await bot.send_message(
+                                chat_id=(
+                                    target_chat_id
+                                ),
+                                text=second_text
+                            )
+                        )
+
+                        state[
+                            "text_message_id"
+                        ] = sent.message_id
+
+                        save_state()
+
+            else:
+                sent = await bot.send_message(
+                    chat_id=target_chat_id,
+                    text=second_text
+                )
+
+                state["text_message_id"] = (
+                    sent.message_id
+                )
+
+                save_state()
+
+        # Если аккаунтов стало 30 или меньше,
+        # второе сообщение больше не нужно.
+        elif text_message_id:
+            try:
+                await bot.edit_message_text(
+                    chat_id=target_chat_id,
+                    message_id=text_message_id,
+                    text=(
+                        "⚪ Вторая часть таблицы "
+                        "сейчас не используется."
+                    )
+                )
+
+            except BadRequest:
+                pass
 
         return True
 
@@ -599,27 +617,29 @@ async def set_target(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    if not is_control(update):
+    if not is_control_chat(update):
         return
 
     message = update.effective_message
 
     if len(context.args) != 1:
         await message.reply_text(
-            "Использование:\n"
+            "Использование:\n\n"
             "/set_target @username\n\n"
-            "или:\n"
+            "или:\n\n"
             "/set_target -100123456789"
         )
 
         return
 
-    value = context.args[0]
+    raw_target = context.args[0]
 
-    if value.lstrip("-").isdigit():
-        target: int | str = int(value)
+    if raw_target.lstrip("-").isdigit():
+        target: int | str = int(
+            raw_target
+        )
     else:
-        target = value
+        target = raw_target
 
     try:
         chat = await context.bot.get_chat(
@@ -628,22 +648,23 @@ async def set_target(
 
     except TelegramError as error:
         await message.reply_text(
-            "Не удалось найти "
-            f"целевой чат: {error}"
+            "Не удалось найти группу:\n"
+            f"{error}"
         )
 
         return
 
     async with state_lock:
         state["target_chat_id"] = chat.id
-        state["target_message_id"] = None
+        state["photo_message_id"] = None
+        state["text_message_id"] = None
 
         save_state()
 
     await message.reply_text(
-        "✅ Цель выбрана: "
+        "✅ Выбрана группа: "
         f"{chat.title or chat.id}\n\n"
-        "Теперь отправь /status_new"
+        "Теперь напиши /status_new"
     )
 
 
@@ -651,19 +672,19 @@ async def status_new(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    if not is_control(update):
+    if not is_control_chat(update):
         return
 
     try:
-        published = await publish_status(
-            context.bot,
-            force_new=True
-        )
+        async with state_lock:
+            created = await create_board(
+                context.bot
+            )
 
-        if published:
+        if created:
             answer = (
-                "✅ Новое сообщение "
-                "опубликовано."
+                "✅ Два новых сообщения "
+                "опубликованы."
             )
         else:
             answer = (
@@ -671,12 +692,11 @@ async def status_new(
                 "/set_target."
             )
 
-    except TelegramError as error:
-        answer = (
-            "Не удалось опубликовать. "
-            "Проверь права бота:\n"
-            f"{error}"
-        )
+    except (
+        TelegramError,
+        ValueError
+    ) as error:
+        answer = f"Ошибка:\n{error}"
 
     await (
         update.effective_message
@@ -688,7 +708,7 @@ async def set_count(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    if not is_control(update):
+    if not is_control_chat(update):
         return
 
     message = update.effective_message
@@ -698,7 +718,7 @@ async def set_count(
         or not context.args[0].isdigit()
     ):
         await message.reply_text(
-            "Использование: /set_count 75"
+            "Использование: /set_count 50"
         )
 
         return
@@ -714,7 +734,7 @@ async def set_count(
     ):
         await message.reply_text(
             "Допустимо от 1 до "
-            f"{MAX_ACCOUNTS} аккаунтов."
+            f"{MAX_ACCOUNTS}."
         )
 
         return
@@ -747,84 +767,113 @@ async def set_count(
 
         save_state()
 
-    await publish_status(
-        context.bot
-    )
+    try:
+        await update_board(
+            context.bot
+        )
 
-    await message.reply_text(
-        "✅ Теперь аккаунтов: "
-        f"{new_count}."
-    )
+        await message.reply_text(
+            "✅ Теперь аккаунтов: "
+            f"{new_count}."
+        )
+
+    except (
+        TelegramError,
+        ValueError
+    ) as error:
+        await message.reply_text(
+            "Количество сохранено, "
+            "но публикация "
+            "не обновилась:\n"
+            f"{error}"
+        )
 
 
 async def set_caption(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    if not is_control(update):
+    if not is_control_chat(update):
         return
 
     message = update.effective_message
-    caption = caption_from_command(update)
+    new_text = get_command_text(update)
 
-    if not caption:
+    if not new_text:
         await message.reply_text(
             "Напиши текст после команды:\n\n"
-            "/set_caption Мой текст и ссылка\n"
+            "/set_caption Мой текст\n"
             "https://example.com\n\n"
-            "Или ответь командой /set_caption "
-            "на сообщение с готовым текстом."
+            "Также можно ответить командой "
+            "/set_caption на готовое сообщение."
         )
 
         return
 
-    if len(caption) > 1024:
-        await message.reply_text(
-            "Подпись длиннее 1024 символов.\n"
-            f"Сейчас: {len(caption)}."
-        )
-
-        return
+    old_text = state["custom_text"]
 
     async with state_lock:
-        state["caption"] = caption
+        state["custom_text"] = new_text
+
+        try:
+            build_messages()
+
+        except ValueError as error:
+            state["custom_text"] = old_text
+
+            await message.reply_text(
+                str(error)
+            )
+
+            return
 
         save_state()
 
-    await publish_status(
-        context.bot
-    )
+    try:
+        await update_board(
+            context.bot
+        )
 
-    await message.reply_text(
-        "✅ Текст и ссылки сохранены."
-    )
+        await message.reply_text(
+            "✅ Текст и ссылки обновлены."
+        )
+
+    except (
+        TelegramError,
+        ValueError
+    ) as error:
+        await message.reply_text(
+            f"Ошибка обновления:\n{error}"
+        )
 
 
 async def status_refresh(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    if not is_control(update):
+    if not is_control_chat(update):
         return
 
     try:
-        updated = await publish_status(
+        updated = await update_board(
             context.bot
         )
 
         if updated:
-            answer = "✅ Таблица обновлена."
+            answer = (
+                "✅ Оба сообщения обновлены."
+            )
         else:
             answer = (
                 "Сначала используй "
-                "/set_target и /status_new."
+                "/set_target."
             )
 
-    except TelegramError as error:
-        answer = (
-            "Ошибка обновления:\n"
-            f"{error}"
-        )
+    except (
+        TelegramError,
+        ValueError
+    ) as error:
+        answer = f"Ошибка:\n{error}"
 
     await (
         update.effective_message
@@ -836,7 +885,7 @@ async def status_info(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    if not is_control(update):
+    if not is_control_chat(update):
         return
 
     await (
@@ -844,14 +893,12 @@ async def status_info(
         .reply_text(
             "Аккаунтов: "
             f"{state['accounts_count']}\n"
-            f"SOURCE: {SOURCE_CHAT_ID}\n"
-            f"CONTROL: {CONTROL_CHAT_ID}\n"
             "TARGET: "
             f"{state['target_chat_id'] or 'не выбран'}\n"
-            "MESSAGE: "
-            f"{state['target_message_id'] or 'не создано'}\n"
-            "Подпись: "
-            f"{len(state['caption'])}/1024 символов"
+            "Сообщение 1: "
+            f"{state['photo_message_id'] or 'нет'}\n"
+            "Сообщение 2: "
+            f"{state['text_message_id'] or 'нет'}"
         )
     )
 
@@ -865,10 +912,7 @@ async def source_handler(
     if message is None:
         return
 
-    if (
-        message.chat_id
-        != SOURCE_CHAT_ID
-    ):
+    if message.chat_id != SOURCE_CHAT_ID:
         return
 
     if not message.text:
@@ -911,27 +955,16 @@ async def source_handler(
     )
 
     try:
-        await publish_status(
+        await update_board(
             context.bot
         )
 
-    except TelegramError:
+    except (
+        TelegramError,
+        ValueError
+    ):
         logger.exception(
-            "Не удалось обновить публикацию"
-        )
-
-
-async def minute_update(
-    context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    try:
-        await publish_status(
-            context.bot
-        )
-
-    except TelegramError:
-        logger.exception(
-            "Ошибка минутного обновления"
+            "Ошибка обновления статуса"
         )
 
 
@@ -941,24 +974,23 @@ async def post_init(
     me = await application.bot.get_me()
 
     logger.info(
-        "Бот запущен как @%s | "
-        "CONTROL_CHAT_ID=%s",
-        me.username,
-        CONTROL_CHAT_ID
+        "Запущен @%s",
+        me.username
     )
 
     if (
         state["target_chat_id"]
-        is not None
-        and state["target_message_id"]
-        is not None
+        and state["photo_message_id"]
     ):
         try:
-            await publish_status(
+            await update_board(
                 application.bot
             )
 
-        except TelegramError:
+        except (
+            TelegramError,
+            ValueError
+        ):
             logger.exception(
                 "Первое обновление "
                 "не удалось"
@@ -975,74 +1007,6 @@ def main() -> None:
         .build()
     )
 
-    # Эту команду можно использовать
-    # в любой группе, чтобы узнать её ID.
     application.add_handler(
         CommandHandler(
-            "chat_id",
-            chat_id_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "set_target",
-            set_target
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "status_new",
-            status_new
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "set_count",
-            set_count
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "set_caption",
-            set_caption
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "status_refresh",
-            status_refresh
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "status_info",
-            status_info
-        )
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            source_handler
-        )
-    )
-
-    application.job_queue.run_repeating(
-        minute_update,
-        interval=UPDATE_INTERVAL,
-        first=UPDATE_INTERVAL
-    )
-
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
-
-
-if __name__ == "__main__":
-    main()
+           
