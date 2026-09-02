@@ -1,10 +1,8 @@
-import asyncio
-import json
-import logging
 import os
 import re
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+import asyncio
+import logging
+from datetime import datetime
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
@@ -16,23 +14,16 @@ from telethon.errors import FloodWaitError
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
-
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])
 TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])
 
-# Сейчас учитываем только аккаунты 1-50
-MIN_ACCOUNT = 1
-MAX_ACCOUNT = 50
+# Сколько аккаунтов показываем во второй группе
+MAX_ACCOUNTS = 50
 
 # Как часто обновлять итоговое сообщение
 UPDATE_INTERVAL = 60
-
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
-
-DATA_FILE = DATA_DIR / "statuses.json"
 
 
 # ============================================================
@@ -41,23 +32,10 @@ DATA_FILE = DATA_DIR / "statuses.json"
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-logger = logging.getLogger("status_aggregator")
-
-
-# ============================================================
-# СОСТОЯНИЕ
-# ============================================================
-
-statuses = {}
-
-# ID сообщения с общей сводкой во второй группе
-summary_message_id = None
-
-# Чтобы не редактировать сообщение без необходимости
-last_rendered_text = None
+log = logging.getLogger("status-bot")
 
 
 # ============================================================
@@ -65,500 +43,220 @@ last_rendered_text = None
 # ============================================================
 
 client = TelegramClient(
-    "status_aggregator_bot",
+    "status_timer_bot",
     API_ID,
-    API_HASH,
+    API_HASH
 )
 
 
 # ============================================================
-# СОХРАНЕНИЕ
+# ДАННЫЕ
 # ============================================================
 
-def save_data():
-    data = {
-        "statuses": statuses,
-        "summary_message_id": summary_message_id,
-    }
+# account_number -> информация
+statuses = {}
 
-    tmp_file = DATA_FILE.with_suffix(".tmp")
-
-    with tmp_file.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-    tmp_file.replace(DATA_FILE)
-
-
-def load_data():
-    global statuses
-    global summary_message_id
-
-    if not DATA_FILE.exists():
-        logger.info("Файл состояния ещё не существует.")
-        return
-
-    try:
-        with DATA_FILE.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        statuses = data.get("statuses", {})
-        summary_message_id = data.get("summary_message_id")
-
-        logger.info(
-            "Состояние загружено: %s аккаунтов",
-            len(statuses),
-        )
-
-    except Exception:
-        logger.exception("Ошибка загрузки statuses.json")
+# ID сообщения во второй группе
+target_message_id = None
 
 
 # ============================================================
-# ПОИСК НОМЕРА АККАУНТА
+# РАЗБОР СТАТУСА
 # ============================================================
 
-def extract_account_number(text: str):
+def parse_status(text: str):
     """
-    Ищет:
-        Аккаунт 10
-        Аккаунт №10
-        Аккаунт #10
-        Account 10
-        ACCOUNT 10
+    Пример входного сообщения:
+
+    Аккаунт 10
+
+    🟢 Свободен
+    email
+    password
+
+    или:
+
+    Аккаунт 12
+
+    🟢 Свободен
+    🟡 Бан метро
+    Осталось: 22ч
+
+    или:
+
+    Аккаунт 37
+
+    🔴 Занят
+    Осталось: 2ч 52м
+
+    или:
+
+    Аккаунт 27
+
+    🟢 Свободен
+    ⚫ Бан
+    Осталось: 1д 11ч
     """
 
     if not text:
         return None
 
-    patterns = [
-        r"\bаккаунт\s*[№#:]?\s*(\d+)\b",
-        r"\baccount\s*[№#:]?\s*(\d+)\b",
-    ]
+    # Ищем номер аккаунта
+    match = re.search(
+        r"(?:аккаунт|account)\s*#?\s*(\d+)",
+        text,
+        re.IGNORECASE
+    )
 
-    for pattern in patterns:
-        match = re.search(
-            pattern,
+    if not match:
+        return None
+
+    account = int(match.group(1))
+
+    # Сейчас показываем 1-50
+    if account < 1 or account > MAX_ACCOUNTS:
+        return None
+
+    # --------------------------------------------------------
+    # СВОБОДЕН
+    # --------------------------------------------------------
+
+    if re.search(r"🟢\s*(?:свободен|свободно)", text, re.IGNORECASE):
+
+        # Бан метро
+        metro = re.search(
+            r"🟡\s*(?:бан\s+метро|метро).*?(?:осталось:\s*)?([^\n]+)",
             text,
-            flags=re.IGNORECASE,
+            re.IGNORECASE
         )
 
-        if match:
-            number = int(match.group(1))
+        if metro:
+            remaining = metro.group(1).strip()
 
-            if MIN_ACCOUNT <= number <= MAX_ACCOUNT:
-                return number
+            return {
+                "account": account,
+                "type": "metro",
+                "remaining": remaining,
+                "priority": 2
+            }
+
+        # Обычный бан / недоступен
+        unavailable = re.search(
+            r"(?:⚫|🔴)\s*(?:бан|не\s*доступен).*?(?:осталось:\s*)?([^\n]+)",
+            text,
+            re.IGNORECASE
+        )
+
+        if unavailable:
+            remaining = unavailable.group(1).strip()
+
+            return {
+                "account": account,
+                "type": "unavailable",
+                "remaining": remaining,
+                "priority": 3
+            }
+
+        return {
+            "account": account,
+            "type": "free",
+            "remaining": "",
+            "priority": 1
+        }
+
+    # --------------------------------------------------------
+    # ЗАНЯТ
+    # --------------------------------------------------------
+
+    if re.search(r"🔴\s*занят", text, re.IGNORECASE):
+
+        remaining_match = re.search(
+            r"осталось:\s*([^\n]+)",
+            text,
+            re.IGNORECASE
+        )
+
+        remaining = ""
+
+        if remaining_match:
+            remaining = remaining_match.group(1).strip()
+
+        return {
+            "account": account,
+            "type": "busy",
+            "remaining": remaining,
+            "priority": 4
+        }
+
+    # --------------------------------------------------------
+    # НЕАКТИВЕН / ДРУГИЕ СТАТУСЫ
+    # --------------------------------------------------------
+    # Нам специально не нужен "Неактивен".
+    # Если исходный бот выставил неизвестный статус,
+    # просто игнорируем его.
 
     return None
 
 
 # ============================================================
-# ПАРСИНГ ТАЙМЕРА
+# ФОРМАТИРОВАНИЕ
 # ============================================================
 
-def parse_duration(text: str):
-    """
-    Поддерживает:
-
-    22ч
-    22 ч
-    2ч 52м
-    1д 11ч
-    1д 11ч 20м
-    49м
-    1д
-    2 часа
-    30 минут
-
-    Возвращает timedelta или None.
-    """
-
-    if not text:
-        return None
-
-    total_seconds = 0
-
-    # Дни
-    day_match = re.search(
-        r"(\d+)\s*(?:д|дн|день|дня|дней)",
-        text,
-        re.IGNORECASE,
-    )
-
-    if day_match:
-        total_seconds += int(day_match.group(1)) * 86400
-
-    # Часы
-    hour_match = re.search(
-        r"(\d+)\s*(?:ч|час|часа|часов)",
-        text,
-        re.IGNORECASE,
-    )
-
-    if hour_match:
-        total_seconds += int(hour_match.group(1)) * 3600
-
-    # Минуты
-    minute_match = re.search(
-        r"(\d+)\s*(?:м|мин|минута|минуты|минут)",
-        text,
-        re.IGNORECASE,
-    )
-
-    if minute_match:
-        total_seconds += int(minute_match.group(1)) * 60
-
-    if total_seconds <= 0:
-        return None
-
-    return timedelta(seconds=total_seconds)
-
-
-# ============================================================
-# ОПРЕДЕЛЕНИЕ СТАТУСА
-# ============================================================
-
-def detect_status(text: str):
-    """
-    Возвращает:
-        free
-        occupied
-        metro_ban
-        unavailable
-        inactive
-        None
-    """
-
-    if not text:
-        return None
-
-    lower = text.lower()
-
-    # Сначала проверяем бан метро,
-    # потому что там одновременно может быть слово "свободен".
-    if (
-        "бан метро" in lower
-        or "🟡 бан метро" in lower
-    ):
-        return "metro_ban"
-
-    # Обычный бан
-    if re.search(
-        r"(?:^|\n)\s*(?:⚫\s*)?бан(?:\s|$)",
-        lower,
-        re.IGNORECASE,
-    ):
-        return "unavailable"
-
-    # Занят
-    if re.search(
-        r"(?:^|\n)\s*(?:🔴\s*)?занят(?:\s|$)",
-        lower,
-        re.IGNORECASE,
-    ):
-        return "occupied"
-
-    # Свободен
-    if re.search(
-        r"(?:^|\n)\s*(?:🟢\s*)?свободен(?:\s|$)",
-        lower,
-        re.IGNORECASE,
-    ):
-        return "free"
-
-    # Неактивен
-    if "неактив" in lower:
-        return "inactive"
-
-    return None
-
-
-# ============================================================
-# ПОЛУЧЕНИЕ ССЫЛКИ НА СООБЩЕНИЕ
-# ============================================================
-
-def make_source_message_link(message_id: int):
-    """
-    Для закрытой супергруппы:
-
-    -1001234567890
-          ↓
-    1234567890
-
-    Telegram message link:
-    https://t.me/c/1234567890/MESSAGE_ID
-    """
-
-    chat_id_string = str(abs(SOURCE_CHAT_ID))
-
-    if chat_id_string.startswith("100"):
-        internal_id = chat_id_string[3:]
-    else:
-        internal_id = chat_id_string
-
-    return f"https://t.me/c/{internal_id}/{message_id}"
-
-
-# ============================================================
-# ОБНОВЛЕНИЕ АККАУНТА
-# ============================================================
-
-def process_message(message):
-    global statuses
-
-    text = message.raw_text or ""
-
-    account = extract_account_number(text)
-
-    if account is None:
-        return False
-
-    status = detect_status(text)
-
-    if status is None:
-        return False
-
-    # Неактивный сейчас не выводим.
-    # Но аккаунт всё равно может существовать.
-    if status == "inactive":
-        if str(account) in statuses:
-            statuses[str(account)]["status"] = "inactive"
-            statuses[str(account)]["expires_at"] = None
-            statuses[str(account)]["source_message_id"] = message.id
-            statuses[str(account)]["source_link"] = make_source_message_link(
-                message.id
-            )
-            save_data()
-
-        logger.info(
-            "ACCOUNT %s: НЕАКТИВЕН (не выводится)",
-            account,
-        )
-
-        return True
-
-    duration = parse_duration(text)
-
-    expires_at = None
-
-    if duration:
-        expires_at = (
-            datetime.now(timezone.utc) + duration
-        ).isoformat()
-
-    source_link = make_source_message_link(message.id)
-
-    statuses[str(account)] = {
-        "account": account,
-        "status": status,
-        "expires_at": expires_at,
-        "source_message_id": message.id,
-        "source_link": source_link,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    save_data()
-
-    logger.info(
-        "ACCOUNT %s -> %s | timer=%s | message=%s",
-        account,
-        status,
-        duration,
-        message.id,
-    )
-
-    return True
-
-
-# ============================================================
-# ПРОВЕРКА ИСТЁКШИХ ТАЙМЕРОВ
-# ============================================================
-
-def normalize_expired_statuses():
-    changed = False
-
-    now = datetime.now(timezone.utc)
-
-    for account, item in statuses.items():
-
-        expires_at = item.get("expires_at")
-
-        if not expires_at:
-            continue
-
-        try:
-            expires = datetime.fromisoformat(expires_at)
-
-        except Exception:
-            item["expires_at"] = None
-            changed = True
-            continue
-
-        if now >= expires:
-
-            # После окончания любого таймера
-            # аккаунт становится свободным.
-            if item.get("status") != "free":
-                item["status"] = "free"
-                item["expires_at"] = None
-                changed = True
-
-                logger.info(
-                    "ACCOUNT %s -> таймер закончился -> СВОБОДЕН",
-                    account,
-                )
-
-    if changed:
-        save_data()
-
-    return changed
-
-
-# ============================================================
-# ФОРМАТИРОВАНИЕ ОСТАВШЕГОСЯ ВРЕМЕНИ
-# ============================================================
-
-def format_remaining(expires_at):
-    if not expires_at:
-        return ""
-
-    try:
-        expires = datetime.fromisoformat(expires_at)
-
-    except Exception:
-        return ""
-
-    now = datetime.now(timezone.utc)
-
-    remaining = expires - now
-
-    if remaining.total_seconds() <= 0:
-        return ""
-
-    total_seconds = int(remaining.total_seconds())
-
-    days = total_seconds // 86400
-    total_seconds %= 86400
-
-    hours = total_seconds // 3600
-    total_seconds %= 3600
-
-    minutes = total_seconds // 60
-
-    parts = []
-
-    if days:
-        parts.append(f"{days}д")
-
-    if hours:
-        parts.append(f"{hours}ч")
-
-    # Показываем минуты, если меньше суток
-    # или если они есть.
-    if minutes or not parts:
-        parts.append(f"{minutes}м")
-
-    return " ".join(parts)
-
-
-# ============================================================
-# ТЕКСТ ОДНОЙ СТРОКИ
-# ============================================================
-
-def get_status_line(item):
+def format_status(item):
     account = item["account"]
-    status = item.get("status")
+    status_type = item["type"]
+    remaining = item["remaining"]
 
-    if status == "free":
+    # Пока ссылка на аккаунт не задана.
+    # Позже сделаем отдельную систему ссылок.
+    account_text = f"ACCOUNT {account}"
+
+    if status_type == "free":
+        return f"{account_text} — 🟢 СВОБОДЕН"
+
+    if status_type == "metro":
         return (
-            f'<a href="{item["source_link"]}">'
-            f"ACCOUNT {account}"
-            f"</a> — 🟢 СВОБОДЕН"
+            f"{account_text} — 🔴 НЕ ДОСТУПЕН — "
+            f"БАН МЕТРО {remaining}"
         )
 
-    if status == "occupied":
-        remaining = format_remaining(
-            item.get("expires_at")
-        )
-
+    if status_type == "unavailable":
         if remaining:
             return (
-                f'<a href="{item["source_link"]}">'
-                f"ACCOUNT {account}"
-                f"</a> — 🔴 ЗАНЯТ — осталось {remaining}"
+                f"{account_text} — 🔴 НЕ ДОСТУПЕН "
+                f"{remaining}"
             )
 
-        return (
-            f'<a href="{item["source_link"]}">'
-            f"ACCOUNT {account}"
-            f"</a> — 🔴 ЗАНЯТ"
-        )
+        return f"{account_text} — 🔴 НЕ ДОСТУПЕН"
 
-    if status == "metro_ban":
-        remaining = format_remaining(
-            item.get("expires_at")
-        )
-
+    if status_type == "busy":
         if remaining:
             return (
-                f'<a href="{item["source_link"]}">'
-                f"ACCOUNT {account}"
-                f"</a> — 🔴 БАН МЕТРО — осталось {remaining}"
+                f"{account_text} — 🔴 ЗАНЯТ "
+                f"{remaining}"
             )
 
-        return (
-            f'<a href="{item["source_link"]}">'
-            f"ACCOUNT {account}"
-            f"</a> — 🔴 БАН МЕТРО"
-        )
-
-    if status == "unavailable":
-        remaining = format_remaining(
-            item.get("expires_at")
-        )
-
-        if remaining:
-            return (
-                f'<a href="{item["source_link"]}">'
-                f"ACCOUNT {account}"
-                f"</a> — 🔴 НЕ ДОСТУПЕН — осталось {remaining}"
-            )
-
-        return (
-            f'<a href="{item["source_link"]}">'
-            f"ACCOUNT {account}"
-            f"</a> — 🔴 НЕ ДОСТУПЕН"
-        )
+        return f"{account_text} — 🔴 ЗАНЯТ"
 
     return None
 
 
 # ============================================================
-# СОЗДАНИЕ ИТОГОВОГО ТЕКСТА
+# СОБИРАЕМ ИТОГОВОЕ СООБЩЕНИЕ
 # ============================================================
 
-def render_summary():
+def build_message():
+
     lines = [
-        "🟢 <b>СТАТУС АРЕНДЫ</b> 🟢",
-        "",
+        "🟢 СТАТУС АРЕНДЫ 🟢",
+        ""
     ]
 
-    # Строго ACCOUNT 1 -> ACCOUNT 50
-    for account in range(
-        MIN_ACCOUNT,
-        MAX_ACCOUNT + 1,
-    ):
+    for account in sorted(statuses.keys()):
 
-        item = statuses.get(str(account))
+        item = statuses[account]
 
-        if not item:
-            # Если аккаунт пока не найден,
-            # не выводим пустую строку.
-            continue
-
-        if item.get("status") == "inactive":
-            continue
-
-        line = get_status_line(item)
+        line = format_status(item)
 
         if line:
             lines.append(line)
@@ -567,278 +265,248 @@ def render_summary():
 
 
 # ============================================================
-# ПОИСК/СОЗДАНИЕ ИТОГОВОГО СООБЩЕНИЯ
+# ПОИСК СТАРЫХ СТАТУСОВ
 # ============================================================
 
-async def get_or_create_summary_message():
-    global summary_message_id
+async def load_old_messages():
 
-    # Если ID уже сохранён — пытаемся найти сообщение
-    if summary_message_id:
+    log.info("========================================")
+    log.info("НАЧАЛО ЗАГРУЗКИ СТАРЫХ СООБЩЕНИЙ")
+    log.info("SOURCE_CHAT_ID = %s", SOURCE_CHAT_ID)
+    log.info("========================================")
 
-        try:
-            message = await client.get_messages(
-                TARGET_CHAT_ID,
-                ids=summary_message_id,
-            )
-
-            if message:
-                return message
-
-        except Exception:
-            logger.exception(
-                "Не удалось получить сохранённое итоговое сообщение."
-            )
-
-    # Ищем сообщение среди последних сообщений группы
-    try:
-
-        async for message in client.iter_messages(
-            TARGET_CHAT_ID,
-            limit=100,
-        ):
-
-            if not message.raw_text:
-                continue
-
-            if "🟢 СТАТУС АРЕНДЫ 🟢" in message.raw_text:
-                summary_message_id = message.id
-                save_data()
-
-                logger.info(
-                    "Найдено существующее итоговое сообщение: %s",
-                    message.id,
-                )
-
-                return message
-
-    except Exception:
-        logger.exception(
-            "Ошибка поиска итогового сообщения."
-        )
-
-    # Создаём новое
-    text = render_summary()
-
-    message = await client.send_message(
-        TARGET_CHAT_ID,
-        text,
-        parse_mode="html",
-        link_preview=False,
-    )
-
-    summary_message_id = message.id
-
-    save_data()
-
-    logger.info(
-        "Создано новое итоговое сообщение: %s",
-        message.id,
-    )
-
-    return message
-
-
-# ============================================================
-# ОБНОВЛЕНИЕ ИТОГОВОГО СООБЩЕНИЯ
-# ============================================================
-
-async def update_summary(force=False):
-    global last_rendered_text
-
-    normalize_expired_statuses()
-
-    text = render_summary()
-
-    if not force and text == last_rendered_text:
-        return
-
-    try:
-
-        message = await get_or_create_summary_message()
-
-        if message.raw_text == text:
-            last_rendered_text = text
-            return
-
-        await client.edit_message(
-            TARGET_CHAT_ID,
-            message.id,
-            text,
-            parse_mode="html",
-            link_preview=False,
-        )
-
-        last_rendered_text = text
-
-        logger.info(
-            "Итоговое сообщение обновлено."
-        )
-
-    except FloodWaitError as e:
-
-        logger.warning(
-            "Telegram FloodWait: ждём %s секунд",
-            e.seconds,
-        )
-
-        await asyncio.sleep(e.seconds)
-
-    except Exception:
-        logger.exception(
-            "Ошибка обновления итогового сообщения."
-        )
-
-
-# ============================================================
-# ПЕРВОНАЧАЛЬНАЯ СИНХРОНИЗАЦИЯ
-# ============================================================
-
-async def initial_sync():
-    logger.info(
-        "Начинаем первоначальную синхронизацию первой группы..."
-    )
-
-    found = set()
+    count = 0
+    found = 0
 
     try:
 
         async for message in client.iter_messages(
             SOURCE_CHAT_ID,
-            limit=None,
+            limit=3000
         ):
 
-            if not message.raw_text:
+            count += 1
+
+            if not message.text:
                 continue
 
-            account = extract_account_number(
-                message.raw_text
-            )
+            parsed = parse_status(message.text)
 
-            if account is None:
-                continue
+            if parsed:
 
-            # Нас интересуют только 1-50
-            if not (
-                MIN_ACCOUNT
-                <= account
-                <= MAX_ACCOUNT
-            ):
-                continue
+                account = parsed["account"]
 
-            # В истории сообщения одного аккаунта могут
-            # встречаться много раз.
-            #
-            # iter_messages идёт от новых к старым,
-            # поэтому первое найденное сообщение —
-            # самое свежее.
-            if account in found:
-                continue
+                # Последнее найденное сообщение для аккаунта
+                # считаем актуальным.
+                if account not in statuses:
+                    statuses[account] = parsed
+                    found += 1
 
-            if process_message(message):
-                found.add(account)
+                    log.info(
+                        "НАЙДЕН АККАУНТ %s | %s",
+                        account,
+                        format_status(parsed)
+                    )
 
-                logger.info(
-                    "Синхронизирован ACCOUNT %s",
-                    account,
-                )
-
-            if len(found) >= MAX_ACCOUNT:
-                # Все 50 нашли.
-                break
-
-    except Exception:
-        logger.exception(
-            "Ошибка первоначальной синхронизации."
+        log.info(
+            "ПРОСМОТРЕНО СООБЩЕНИЙ: %s",
+            count
         )
 
-    logger.info(
-        "Первоначальная синхронизация завершена. Найдено: %s/50",
-        len(found),
+        log.info(
+            "НАЙДЕНО АККАУНТОВ: %s",
+            found
+        )
+
+    except Exception:
+
+        log.exception(
+            "ОШИБКА ПРИ ЧТЕНИИ ИСТОРИИ SOURCE_CHAT"
+        )
+
+        raise
+
+
+# ============================================================
+# СОЗДАНИЕ / ОБНОВЛЕНИЕ ИТОГОВОГО СООБЩЕНИЯ
+# ============================================================
+
+async def update_target_message():
+
+    global target_message_id
+
+    text = build_message()
+
+    log.info(
+        "Обновление итогового сообщения. Аккаунтов: %s",
+        len(statuses)
     )
+
+    try:
+
+        # Если сообщение ещё неизвестно —
+        # ищем последнее сообщение нашего бота
+        if target_message_id is None:
+
+            me = await client.get_me()
+
+            log.info(
+                "Бот: @%s",
+                me.username
+            )
+
+            async for message in client.iter_messages(
+                TARGET_CHAT_ID,
+                limit=30
+            ):
+
+                if (
+                    message.sender_id == me.id
+                    and message.text
+                    and "🟢 СТАТУС АРЕНДЫ 🟢" in message.text
+                ):
+
+                    target_message_id = message.id
+
+                    log.info(
+                        "НАЙДЕНО СТАРОЕ ИТОГОВОЕ СООБЩЕНИЕ: %s",
+                        target_message_id
+                    )
+
+                    break
+
+        # Если сообщения ещё нет — создаём
+        if target_message_id is None:
+
+            message = await client.send_message(
+                TARGET_CHAT_ID,
+                text
+            )
+
+            target_message_id = message.id
+
+            log.info(
+                "СОЗДАНО ИТОГОВОЕ СООБЩЕНИЕ: %s",
+                target_message_id
+            )
+
+        else:
+
+            await client.edit_message(
+                TARGET_CHAT_ID,
+                target_message_id,
+                text
+            )
+
+            log.info(
+                "ИТОГОВОЕ СООБЩЕНИЕ ОБНОВЛЕНО: %s",
+                target_message_id
+            )
+
+    except FloodWaitError as e:
+
+        log.warning(
+            "FloodWait: ждём %s секунд",
+            e.seconds
+        )
+
+        await asyncio.sleep(e.seconds)
+
+    except Exception:
+
+        log.exception(
+            "ОШИБКА ОБНОВЛЕНИЯ TARGET"
+        )
+
+
+# ============================================================
+# НОВОЕ / ИЗМЕНЁННОЕ СООБЩЕНИЕ
+# ============================================================
+
+async def process_message(message):
+
+    if not message:
+        return
+
+    if not message.text:
+        return
+
+    parsed = parse_status(message.text)
+
+    if not parsed:
+        return
+
+    account = parsed["account"]
+
+    statuses[account] = parsed
+
+    log.info(
+        "ИЗМЕНЕНИЕ | ACCOUNT %s | %s",
+        account,
+        format_status(parsed)
+    )
+
+    await update_target_message()
 
 
 # ============================================================
 # НОВЫЕ СООБЩЕНИЯ
 # ============================================================
 
-@client.on(
-    events.NewMessage(
-        chats=SOURCE_CHAT_ID
+@client.on(events.NewMessage(chats=SOURCE_CHAT_ID))
+async def new_message_handler(event):
+
+    log.info(
+        "Получено НОВОЕ сообщение SOURCE | id=%s",
+        event.message.id
     )
-)
-async def new_source_message(event):
 
-    try:
-
-        message = event.message
-
-        if process_message(message):
-            await update_summary(
-                force=True
-            )
-
-    except Exception:
-        logger.exception(
-            "Ошибка обработки нового сообщения."
-        )
+    await process_message(event.message)
 
 
 # ============================================================
 # ИЗМЕНЕНИЯ СООБЩЕНИЙ
 # ============================================================
 
-@client.on(
-    events.MessageEdited(
-        chats=SOURCE_CHAT_ID
+@client.on(events.MessageEdited(chats=SOURCE_CHAT_ID))
+async def edited_message_handler(event):
+
+    log.info(
+        "Получено ИЗМЕНЕНИЕ SOURCE | id=%s",
+        event.message.id
     )
-)
-async def edited_source_message(event):
 
-    try:
-
-        message = event.message
-
-        if process_message(message):
-            await update_summary(
-                force=True
-            )
-
-    except Exception:
-        logger.exception(
-            "Ошибка обработки изменённого сообщения."
-        )
+    await process_message(event.message)
 
 
 # ============================================================
-# МИНУТНЫЙ ТАЙМЕР
+# ПЕРИОДИЧЕСКОЕ ОБНОВЛЕНИЕ
 # ============================================================
 
-async def timer_loop():
-
-    global last_rendered_text
+async def periodic_update():
 
     while True:
 
         try:
 
-            # Пересчитываем окончания
-            normalize_expired_statuses()
+            await asyncio.sleep(UPDATE_INTERVAL)
 
-            # Создаём новый текст с актуальными минутами
-            text = render_summary()
-
-            if text != last_rendered_text:
-                await update_summary()
-
-        except Exception:
-            logger.exception(
-                "Ошибка в timer_loop."
+            log.info(
+                "МИНУТНЫЙ ЦИКЛ | аккаунтов: %s",
+                len(statuses)
             )
 
-        await asyncio.sleep(
-            UPDATE_INTERVAL
-        )
+            await update_target_message()
+
+        except asyncio.CancelledError:
+
+            raise
+
+        except Exception:
+
+            log.exception(
+                "Ошибка минутного цикла"
+            )
 
 
 # ============================================================
@@ -847,71 +515,90 @@ async def timer_loop():
 
 async def main():
 
-    logger.info(
-        "=================================================="
-    )
+    log.info("========================================")
+    log.info("STATUS TIMER BOT")
+    log.info("========================================")
 
-    logger.info(
-        "STATUS AGGREGATOR STARTING"
-    )
+    log.info("[1] API_ID загружен")
+    log.info("[2] API_HASH загружен")
+    log.info("[3] BOT_TOKEN загружен")
+    log.info("[4] SOURCE_CHAT_ID = %s", SOURCE_CHAT_ID)
+    log.info("[5] TARGET_CHAT_ID = %s", TARGET_CHAT_ID)
 
-    logger.info(
-        "SOURCE_CHAT_ID = %s",
-        SOURCE_CHAT_ID,
-    )
+    log.info("[6] Подключение к Telegram...")
 
-    logger.info(
-        "TARGET_CHAT_ID = %s",
-        TARGET_CHAT_ID,
-    )
-
-    logger.info(
-        "ACCOUNTS = %s-%s",
-        MIN_ACCOUNT,
-        MAX_ACCOUNT,
-    )
-
-    logger.info(
-        "=================================================="
-    )
-
-    load_data()
-
-    # Подключение через BOT TOKEN
     await client.start(
         bot_token=BOT_TOKEN
     )
 
+    log.info("[7] Telegram подключен")
+
     me = await client.get_me()
 
-    logger.info(
-        "Бот авторизован: @%s | id=%s",
+    log.info(
+        "[8] Авторизован как @%s | id=%s | bot=%s",
         me.username,
         me.id,
+        me.bot
     )
 
-    # Первоначально читаем существующую историю
-    await initial_sync()
+    # Проверяем доступ к SOURCE
+    log.info("[9] Проверяем SOURCE...")
 
-    # Создаём/находим одно сообщение во второй группе
-    await get_or_create_summary_message()
+    source = await client.get_entity(SOURCE_CHAT_ID)
 
-    # Первое обновление
-    await update_summary(
-        force=True
+    log.info(
+        "[10] SOURCE найден: %s",
+        getattr(source, "title", "unknown")
     )
 
-    # Запускаем минутный цикл
+    # Проверяем TARGET
+    log.info("[11] Проверяем TARGET...")
+
+    target = await client.get_entity(TARGET_CHAT_ID)
+
+    log.info(
+        "[12] TARGET найден: %s",
+        getattr(target, "title", "unknown")
+    )
+
+    # Загружаем существующие статусы
+    log.info("[13] Загружаем существующие статусы...")
+
+    await load_old_messages()
+
+    # Создаём первое итоговое сообщение
+    log.info("[14] Создаём итоговое сообщение...")
+
+    await update_target_message()
+
+    log.info("========================================")
+    log.info(
+        "[READY] БОТ ЗАПУЩЕН | АККАУНТОВ: %s",
+        len(statuses)
+    )
+    log.info("========================================")
+
+    # Запускаем минутное обновление
     asyncio.create_task(
-        timer_loop()
+        periodic_update()
     )
 
-    logger.info(
-        "Бот запущен и ожидает изменения статусов..."
-    )
-
-    # Ждём события Telegram
+    # Оставляем Telegram connection открытым
     await client.run_until_disconnected()
 
 
-# =========
+if __name__ == "__main__":
+
+    try:
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+
+        log.info("Остановка бота")
+
+    except Exception:
+
+        log.exception(
+            "КРИТИЧЕСКАЯ ОШИБКА"
+                    )
